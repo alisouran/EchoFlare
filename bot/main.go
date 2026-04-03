@@ -1035,29 +1035,21 @@ func main() {
 					return
 				}
 
-				// Patch the in-memory config and write the domain into config.yaml.
+				// Patch the in-memory config and write the domain into config.yaml
+				// using sed for a surgical, line-precise replacement that cannot
+				// corrupt the YAML structure.
 				cfg.Scanner.Domain = newDomain
-				if data, err := os.ReadFile(cfgPath); err == nil {
-					updated := string(data)
-					if strings.Contains(updated, "domain:") {
-						// Replace the existing (empty/placeholder) domain line.
-						lines := strings.Split(updated, "\n")
-						for i, line := range lines {
-							if strings.TrimSpace(line) == "domain:" || strings.HasPrefix(strings.TrimSpace(line), "domain:") {
-								lines[i] = "  domain: \"" + newDomain + "\""
-								break
-							}
-						}
-						updated = strings.Join(lines, "\n")
-					} else {
-						// Append domain under the scanner: section.
-						updated = strings.ReplaceAll(updated, "scanner:", "scanner:\n  domain: \""+newDomain+"\"")
-					}
-					if err := os.WriteFile(cfgPath, []byte(updated), 0o600); err == nil {
-						safeSend(destChat, fmt.Sprintf("✅ Domain `%s` saved to config.yaml.", newDomain), tb.ModeMarkdown)
-					} else {
-						safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not write config.yaml: %v", err))
-					}
+				// sed replaces the first line of the form "  domain: ..." under the
+				// scanner: section.  The pattern anchors on leading whitespace + "domain:"
+				// to avoid touching unrelated keys.
+				sedCmd := fmt.Sprintf(
+					`sed -i 's|^\(\s*\)domain:.*|\1domain: "%s"|' %s`,
+					newDomain, cfgPath,
+				)
+				if out, err := exec.Command("bash", "-c", sedCmd).CombinedOutput(); err != nil {
+					safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not write config.yaml: %v — %s", err, strings.TrimSpace(string(out))))
+				} else {
+					safeSend(destChat, fmt.Sprintf("✅ Domain `%s` saved to config.yaml.", newDomain), tb.ModeMarkdown)
 				}
 			}
 
