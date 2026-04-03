@@ -714,6 +714,30 @@ func main() {
 	})
 
 	// ---- /scan <duration> — admin only ----------------------------------------
+	// formatDuration returns a MM:SS string from a time.Duration.
+	formatDuration := func(d time.Duration) string {
+		if d < 0 {
+			d = 0
+		}
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		return fmt.Sprintf("%02d:%02d", m, s)
+	}
+
+	// buildProgressMsg renders the live scan progress card.
+	buildProgressMsg := func(remaining time.Duration, hits int, domain, status string) string {
+		bar := "━━━━━━━━━━━━━━━━━━━━━━━━"
+		return fmt.Sprintf(
+			"📡 *EchoFlare Live Scan*\n%s\n⏳ Remaining Time: `%s`\n🎯 Successful Hits: *%s IPs*\n🔎 Active Domain: `%s`\n%s\nStatus: %s",
+			bar,
+			formatDuration(remaining),
+			formatInt(hits),
+			domain,
+			bar,
+			status,
+		)
+	}
+
 	bot.Handle("/scan", func(c tb.Context) error {
 		if !adminOnly(c) {
 			return nil
@@ -737,13 +761,34 @@ func main() {
 		}
 		scanRunning.Store(true)
 
-		reply(c, fmt.Sprintf("🔍 Starting DNS scan for %s...\nStopping VPN first.", dur))
-
 		destChat := c.Chat()
 		adminChat := &tb.Chat{ID: cfg.Telegram.OwnerID}
+		domain := cfg.Scanner.Domain
+		logFile := cfg.Scanner.LogFile
 
 		send := func(text string) {
 			safeSend(destChat, text)
+		}
+
+		// Send the initial progress card and keep the message handle for editing.
+		initMsg, initErr := bot.Send(destChat,
+			buildProgressMsg(dur, 0, domain, "Starting services..."),
+			tb.ModeMarkdown,
+		)
+		if initErr != nil {
+			logger.Warn("scan: could not send progress card", "err", initErr)
+		}
+
+		// editProgress updates the live card; silently ignores Telegram rate-limit
+		// errors (420) — the next tick will retry automatically.
+		editProgress := func(remaining time.Duration, hits int, status string) {
+			if initMsg == nil {
+				return
+			}
+			text := buildProgressMsg(remaining, hits, domain, status)
+			if _, err := bot.Edit(initMsg, text, tb.ModeMarkdown); err != nil {
+				logger.Debug("scan progress edit error (likely rate-limit)", "err", err)
+			}
 		}
 
 		go func() {
@@ -762,7 +807,6 @@ func main() {
 				}
 				return
 			}
-			send("✅ VPN stopped.")
 
 			// Step 2: Start EchoCatcher.
 			if err := svcCmd("start", cfg.Services.Scanner); err != nil {
@@ -776,23 +820,43 @@ func main() {
 				send("✅ VPN restarted.")
 				return
 			}
-			send(fmt.Sprintf("✅ EchoCatcher started. Scanning for %s...", dur))
 
-			// Step 3: Wait.
-			time.Sleep(dur)
+			// Step 3: Wait with live progress ticker (edit every 5 s, respect Telegram rate limits).
+			deadline := time.Now().Add(dur)
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+
+			editProgress(dur, 0, "Scanning... 🔥")
+		tickLoop:
+			for {
+				select {
+				case now := <-ticker.C:
+					remaining := time.Until(deadline)
+					if remaining <= 0 {
+						break tickLoop
+					}
+					hits := countScanHits(logFile)
+					editProgress(remaining, hits, "Scanning... 🔥")
+					_ = now
+				case <-time.After(time.Until(deadline)):
+					break tickLoop
+				}
+			}
 
 			// Step 4: Stop EchoCatcher.
+			editProgress(0, countScanHits(logFile), "Stopping scanner...")
 			if err := svcCmd("stop", cfg.Services.Scanner); err != nil {
 				logger.Warn("stop scanner error", "err", err)
 			}
-			send("🛑 EchoCatcher stopped. Collecting results...")
+
+			finalHits := countScanHits(logFile)
+			editProgress(0, finalHits, "Collecting results...")
 
 			// Step 5: Parse results, generate artifacts, deliver files.
-			logFile := cfg.Scanner.LogFile
 			if _, statErr := os.Stat(logFile); os.IsNotExist(statErr) {
+				editProgress(0, 0, "⚠️ No results file found.")
 				send("⚠️ Scan log file not found — scan may have produced no results.")
 			} else {
-				// Parse NDJSON hits sorted by latency ascending.
 				hits, parseErr := parseScanHits(logFile)
 				hitCount := len(hits)
 				if parseErr != nil {
@@ -800,7 +864,17 @@ func main() {
 					hitCount = countScanHits(logFile)
 				}
 
-				// Deliver working_resolvers.json — failure is logged but never blocks the TOML.
+				// Final edit: mark the card as complete.
+				bar := "━━━━━━━━━━━━━━━━━━━━━━━━"
+				if initMsg != nil {
+					completeText := fmt.Sprintf(
+						"✅ *Scan Complete!*\n%s\n⏳ Duration: `%s`\n🎯 Total Hits: *%s IPs*\n🔎 Domain: `%s`\n%s\nStatus: Done — sending files...",
+						bar, formatDuration(dur), formatInt(hitCount), domain, bar,
+					)
+					bot.Edit(initMsg, completeText, tb.ModeMarkdown) //nolint:errcheck
+				}
+
+				// Deliver working_resolvers.json — failure never blocks the TOML.
 				jsonDoc := &tb.Document{
 					File:     tb.FromDisk(logFile),
 					FileName: "working_resolvers.json",
@@ -836,7 +910,7 @@ func main() {
 				}
 
 				safeSend(adminChat,
-					fmt.Sprintf("✨ *Scan Complete!*\n%d clean resolver IPs found.\nTop 50 exported to `masterdnsvpn_resolvers.toml`.\n\nBoth files sent above.", hitCount),
+					fmt.Sprintf("✨ *Scan Complete!*\n%s clean resolver IPs found.\nTop 50 exported to `masterdnsvpn_resolvers.toml`.\n\nBoth files sent above.", formatInt(hitCount)),
 					tb.ModeMarkdown,
 				)
 			}
@@ -1184,4 +1258,20 @@ func main() {
 	}
 
 	logger.Info("orchestrator bot stopped", "registered_users", users.Len())
+}
+
+// formatInt formats an integer with comma thousands separators (e.g. 1247 → "1,247").
+func formatInt(n int) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var result []byte
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			result = append(result, ',')
+		}
+		result = append(result, byte(c))
+	}
+	return string(result)
 }
