@@ -23,31 +23,37 @@ jobs:
             goos: linux
             goarch: amd64
             binary: scattergun
+            buildflags: ""
 
           - name: linux-arm64
             goos: linux
             goarch: arm64
             binary: scattergun
+            buildflags: ""
 
           - name: darwin-amd64
             goos: darwin
             goarch: amd64
             binary: scattergun
+            buildflags: ""
 
           - name: darwin-arm64
             goos: darwin
             goarch: arm64
             binary: scattergun
+            buildflags: ""
 
           - name: windows-amd64
             goos: windows
             goarch: amd64
             binary: scattergun.exe
+            buildflags: ""
 
           - name: android-arm64
             goos: linux
             goarch: arm64
             binary: scattergun
+            buildflags: "-buildmode=pie"
 
     steps:
       - name: Checkout
@@ -65,7 +71,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.binary }}" ./scattergun/
+          go build -trimpath -ldflags="-s -w" ${{ matrix.buildflags }} -o "dist/${{ matrix.binary }}" ./scattergun/
 
       - name: Create sample resolvers.txt
         run: |
