@@ -1035,21 +1035,43 @@ func main() {
 					return
 				}
 
-				// Patch the in-memory config and write the domain into config.yaml
-				// using sed for a surgical, line-precise replacement that cannot
-				// corrupt the YAML structure.
+				// Patch the in-memory config and write the domain into config.yaml.
+				// We rewrite the file line-by-line, replacing only the "domain:" key
+				// that sits directly inside the "scanner:" section (tracked by a flag),
+				// so services.scanner and any other keys are never touched.
 				cfg.Scanner.Domain = newDomain
-				// sed replaces the first line of the form "  domain: ..." under the
-				// scanner: section.  The pattern anchors on leading whitespace + "domain:"
-				// to avoid touching unrelated keys.
-				sedCmd := fmt.Sprintf(
-					`sed -i 's|^\(\s*\)domain:.*|\1domain: "%s"|' %s`,
-					newDomain, cfgPath,
-				)
-				if out, err := exec.Command("bash", "-c", sedCmd).CombinedOutput(); err != nil {
-					safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not write config.yaml: %v — %s", err, strings.TrimSpace(string(out))))
+				if rawCfg, readErr := os.ReadFile(cfgPath); readErr != nil {
+					safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not read config.yaml: %v", readErr))
 				} else {
-					safeSend(destChat, fmt.Sprintf("✅ Domain `%s` saved to config.yaml.", newDomain), tb.ModeMarkdown)
+					lines := strings.Split(string(rawCfg), "\n")
+					inScannerSection := false
+					domainWritten := false
+					for i, line := range lines {
+						trimmed := strings.TrimSpace(line)
+						// Detect section headers (non-indented keys ending with colon).
+						if len(trimmed) > 0 && !strings.HasPrefix(trimmed, "#") && strings.HasSuffix(trimmed, ":") && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+							inScannerSection = trimmed == "scanner:"
+						}
+						// Replace the domain key only when we are inside the scanner section.
+						if inScannerSection && !domainWritten && strings.HasPrefix(trimmed, "domain:") {
+							lines[i] = `  domain: "` + newDomain + `"`
+							domainWritten = true
+						}
+					}
+					if !domainWritten {
+						// domain key missing entirely — append it after the scanner: header.
+						for i, line := range lines {
+							if strings.TrimSpace(line) == "scanner:" {
+								lines = append(lines[:i+1], append([]string{`  domain: "` + newDomain + `"`}, lines[i+1:]...)...)
+								break
+							}
+						}
+					}
+					if writeErr := os.WriteFile(cfgPath, []byte(strings.Join(lines, "\n")), 0o600); writeErr != nil {
+						safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not write config.yaml: %v", writeErr))
+					} else {
+						safeSend(destChat, fmt.Sprintf("✅ Domain `%s` saved to config.yaml.", newDomain), tb.ModeMarkdown)
+					}
 				}
 			}
 
