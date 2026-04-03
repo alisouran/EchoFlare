@@ -267,6 +267,7 @@ The Orchestrator Bot is your remote control. It handles the Port 53 hand-off aut
 | Command | What it does |
 |---|---|
 | `/scan <duration>` | Full scan lifecycle: stop VPN → start EchoCatcher → wait → send results → restart VPN. Delivers **two files**: `working_resolvers.json` (raw hits) and `masterdnsvpn_resolvers.toml` (top 50 by latency, ready to paste). Example: `/scan 5m` |
+| `/help` | For the **Admin**: shows all commands plus a **📡 Scan Configuration** section with the active scan domain and a ready-to-copy `scattergun` command template. For public users: shows a generic welcome message. |
 | `/status` | Live service states + server CPU% and RAM, plus registered user count |
 | `/toggle_vpn` | Start the VPN if stopped; stop it if running |
 | `/get_logs` | Last 50 lines of VPN service logs |

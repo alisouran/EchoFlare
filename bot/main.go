@@ -65,6 +65,7 @@ type ServicesConfig struct {
 
 type ScannerConfig struct {
 	LogFile string `yaml:"log_file"`
+	Domain  string `yaml:"domain"`
 }
 
 type HealthConfig struct {
@@ -605,6 +606,10 @@ func main() {
 	}
 
 	// ---- Help text ------------------------------------------------------------
+	scanDomain := cfg.Scanner.Domain
+	if scanDomain == "" {
+		scanDomain = "scan.yourdomain.com (not set in config)"
+	}
 	adminHelpText := strings.Join([]string{
 		"*🤖 Server Orchestrator Bot — Admin*",
 		"",
@@ -619,6 +624,14 @@ func main() {
 		"/update — pull latest code from GitHub and rebuild all binaries",
 		"/cmd <command> — run a shell command on the server (5-min timeout)",
 		"/help — show this message",
+		"",
+		"*📡 Scan Configuration*",
+		"Domain: `" + scanDomain + "`",
+		"",
+		"Run on your restricted device:",
+		"`./scattergun -list resolvers.txt -domain " + scanDomain + "`",
+		"With DPI payload test:",
+		"`./scattergun -list resolvers.txt -domain " + scanDomain + " -pad 1000 -qtype TXT`",
 	}, "\n")
 
 	publicHelpText := strings.Join([]string{
