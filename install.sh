@@ -191,19 +191,25 @@ if [[ -f "${CONFIG_FILE}" ]]; then
     IS_UPDATE=true
     info "Existing installation detected — preserving config, skipping prompts."
 
-    # Back up the config. We do NOT parse YAML values with grep/sed — that
-    # is fragile and was the root cause of the premature-exit bug:
-    #   empty variable → [[ -n ]] check fails → error() → exit 1
-    # The Go binary reads the YAML file directly; we never need to extract values.
+    # Back up the config first (disaster recovery).
     cp "${CONFIG_FILE}" "${CONFIG_BACKUP}"
     success "Config backed up to ${CONFIG_BACKUP}"
-    success "Updating EchoFlare — existing config will be preserved."
 
-    # Dummy values so the heredoc in Step 6 has no unset variables.
-    # They are never written to disk — the backup is restored in Step 10.
-    BOT_TOKEN="__preserved__"
-    ADMIN_ID="0"
-    SCAN_DOMAIN="preserved"
+    # Extract the real values from the existing YAML so service files are
+    # regenerated with the correct domain, not a placeholder.
+    # Each grep uses "|| true" so a no-match never triggers set -e.
+    BOT_TOKEN=$(grep -m1 'token:' "${CONFIG_FILE}" | sed 's/.*token:[[:space:]]*"\(.*\)".*/\1/' || true)
+    ADMIN_ID=$(grep -m1 'owner_id:' "${CONFIG_FILE}" | awk '{print $2}' || true)
+    # Domain lives under the scanner: section — match only indented domain: lines.
+    SCAN_DOMAIN=$(grep -A10 '^scanner:' "${CONFIG_FILE}" | grep -m1 '^\ *domain:' | sed 's/.*domain:[[:space:]]*"\(.*\)".*/\1/' | tr -d '"' || true)
+
+    # Validate — fall back to safe placeholder if extraction failed, but warn loudly.
+    [[ -n "${BOT_TOKEN}" ]]   || { warn "Could not extract token from config — using placeholder.";   BOT_TOKEN="REPLACE_WITH_YOUR_BOT_TOKEN"; }
+    [[ -n "${ADMIN_ID}" ]]    || { warn "Could not extract owner_id from config — using 0.";          ADMIN_ID="0"; }
+    [[ -n "${SCAN_DOMAIN}" ]] || { warn "Could not extract scanner.domain from config — using placeholder."; SCAN_DOMAIN="scan.yourdomain.com"; }
+
+    success "Extracted config: domain=${SCAN_DOMAIN}, admin_id=${ADMIN_ID}"
+    success "Updating EchoFlare — existing config will be preserved."
 
 elif [[ ! -t 0 ]]; then
     warn "Non-interactive shell detected (curl-pipe mode)."
