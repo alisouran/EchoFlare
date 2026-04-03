@@ -189,7 +189,7 @@ CONFIG_BACKUP="/tmp/dns-orchestrator-config.bak"
 
 if [[ -f "${CONFIG_FILE}" ]]; then
     IS_UPDATE=true
-    info "Existing installation detected — preserving config, skipping prompts."
+    info "Existing installation detected — keeping config unchanged, skipping prompts."
 
     # Back up the config first (disaster recovery).
     cp "${CONFIG_FILE}" "${CONFIG_BACKUP}"
@@ -209,7 +209,7 @@ if [[ -f "${CONFIG_FILE}" ]]; then
     [[ -n "${SCAN_DOMAIN}" ]] || { warn "Could not extract scanner.domain from config — using placeholder."; SCAN_DOMAIN="scan.yourdomain.com"; }
 
     success "Extracted config: domain=${SCAN_DOMAIN}, admin_id=${ADMIN_ID}"
-    success "Updating EchoFlare — existing config will be preserved."
+    success "Updating EchoFlare — existing config untouched."
 
 elif [[ ! -t 0 ]]; then
     warn "Non-interactive shell detected (curl-pipe mode)."
@@ -250,7 +250,7 @@ mkdir -p "${LOG_DIR}"
 chmod 750 "${LOG_DIR}"
 
 if [[ "${IS_UPDATE}" == "true" ]]; then
-    info "Update mode — skipping config write.  Backup will be restored at the end."
+    info "Update mode — skipping config write.  Backup saved to ${CONFIG_BACKUP} for manual recovery."
 else
     # Write the YAML config.  Use single-quoted heredoc delimiter (<<'EOF') so that
     # the shell does NOT expand $BOT_TOKEN etc. inside the heredoc — those are

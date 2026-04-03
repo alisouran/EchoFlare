@@ -130,11 +130,13 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 		for _, q := range r.Question {
 			qname := strings.ToLower(q.Name) // DNS names are case-insensitive
 
-			// Only process queries that match our scan subdomain.
+			// Log every query we receive — even non-matching ones — so we can
+			// confirm packets are reaching the process regardless of domain match.
 			if !strings.HasSuffix(qname, strings.ToLower(suffix)) {
-				logger.Warn("unexpected query (not our domain)",
+				logger.Info("dns_raw_packet",
 					"name", q.Name,
 					"forwarder", forwarderIP,
+					"payload_bytes", payloadBytes,
 				)
 				// Still add the dummy A record so the reply is well-formed.
 				m.Answer = append(m.Answer, dummyA(q.Name))
@@ -166,7 +168,8 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 
 			// ---- Decode timestamp and compute latency ------------------------
 			var latencySec int64
-			ts, err := strconv.ParseInt(tsStr, 10, 64)
+			// scattergun encodes the timestamp as 8-char hex (e.g. "66079920").
+			ts, err := strconv.ParseInt(tsStr, 16, 64)
 			if err != nil {
 				logger.Warn("timestamp parse error",
 					"ts_raw", tsStr,
@@ -256,10 +259,11 @@ func main() {
 	var queryCount atomic.Int64
 
 	// ---- Register DNS handler -------------------------------------------------
-	// miekg/dns uses dns.DefaultServeMux (similar to net/http).
-	// Register the handler for the scan domain plus a trailing dot (FQDN).
-	handlerDomain := dns.Fqdn(cfg.domain)
-	dns.HandleFunc(handlerDomain, makeHandler(cfg.domain, logger, &queryCount))
+	// Use a catch-all "." handler so every UDP/53 packet is logged, even if the
+	// query doesn't match our domain.  This makes it easy to confirm packets are
+	// reaching the process at all.  makeHandler still filters by domain suffix for
+	// structured dns_hit logging; unmatched queries log as dns_raw_packet.
+	dns.HandleFunc(".", makeHandler(cfg.domain, logger, &queryCount))
 
 	// ---- Start DNS server -----------------------------------------------------
 	server := &dns.Server{

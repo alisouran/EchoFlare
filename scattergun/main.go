@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	./scattergun -list ips.txt -domain scan.example.com -workers 200 -retries 3 -jitter 10ms
+//	./scattergun -list ips.txt -domain scan.example.com -workers 10 -retries 1 -jitter 150ms
 //	./scattergun -list ips.txt -domain scan.example.com -pad 1000 -qtype TXT
 //
 // For each IP in the input file, scattergun crafts a DNS query whose QNAME
@@ -71,9 +71,9 @@ func parseFlags() config {
 	cfg := config{}
 	flag.StringVar(&cfg.listFile, "list", "", "Path to newline-separated list of resolver IPs (required)")
 	flag.StringVar(&cfg.domain, "domain", "", "Root scan domain, e.g. scan.yourdomain.com (required)")
-	flag.IntVar(&cfg.workers, "workers", 200, "Number of concurrent sender goroutines")
-	flag.IntVar(&cfg.retries, "retries", 3, "Number of UDP sends per IP (to mitigate packet loss)")
-	flag.DurationVar(&cfg.jitter, "jitter", 10*time.Millisecond, "Max random sleep between retries")
+	flag.IntVar(&cfg.workers, "workers", 10, "Number of concurrent sender goroutines")
+	flag.IntVar(&cfg.retries, "retries", 1, "Number of UDP sends per IP (to mitigate packet loss)")
+	flag.DurationVar(&cfg.jitter, "jitter", 150*time.Millisecond, "Max random sleep between retries")
 	flag.IntVar(&cfg.pad, "pad", 0, "Inflate DNS packet to this many bytes using EDNS0 Padding (RFC 7830). 0 = disabled. Use -pad 1000 to simulate VPN tunnel traffic.")
 	flag.StringVar(&cfg.qtype, "qtype", "A", `DNS query type: "A" (default), "TXT", or "AAAA". Combine with -pad for realistic DPI simulation.`)
 	flag.Parse()
@@ -152,7 +152,8 @@ func buildQNAME(rawIP, domain string) (string, error) {
 
 	ts := time.Now().Unix()
 	// dns.Fqdn appends the trailing dot required by the DNS wire format.
-	return dns.Fqdn(fmt.Sprintf("%s.%d.%s", hexIP, ts, domain)), nil
+	// Timestamp encoded as 8-char hex (vs 10-char decimal) to shorten the QNAME label.
+	return dns.Fqdn(fmt.Sprintf("%s.%08x.%s", hexIP, ts, domain)), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +227,15 @@ func sendUDP(targetIP string, msgBytes []byte) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 		return fmt.Errorf("set deadline %s: %w", targetIP, err)
 	}
+
+	// Randomize the DNS Transaction ID (first 2 bytes of the wire format) for
+	// every individual packet so each probe looks unique to DPI inspection.
+	if len(msgBytes) >= 2 {
+		txid := dns.Id()
+		msgBytes[0] = byte(txid >> 8)
+		msgBytes[1] = byte(txid)
+	}
+
 	if _, err := conn.Write(msgBytes); err != nil {
 		return fmt.Errorf("write to %s: %w", targetIP, err)
 	}
@@ -295,6 +305,13 @@ func worker(
 				sleep := time.Duration(rng.Int63n(int64(jitter) + 1))
 				time.Sleep(sleep)
 			}
+		}
+
+		// Mandatory inter-IP delay (50–200 ms) to avoid flooding and ISP rate-limits.
+		// This fires regardless of the retries count, keeping probes low-frequency.
+		if ctx.Err() == nil {
+			interPacketDelay := 50*time.Millisecond + time.Duration(rng.Int63n(int64(150*time.Millisecond)))
+			time.Sleep(interPacketDelay)
 		}
 	}
 }

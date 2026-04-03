@@ -808,6 +808,9 @@ func main() {
 				return
 			}
 
+			// Brief pause so the OS fully releases port 53 before echocatcher binds.
+			time.Sleep(2 * time.Second)
+
 			// Step 2: Start EchoCatcher.
 			if err := svcCmd("start", cfg.Services.Scanner); err != nil {
 				errMsg := err.Error()
@@ -826,7 +829,7 @@ func main() {
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
 
-			editProgress(dur, 0, "Scanning... 🔥")
+			editProgress(dur, 0, "Probing stealthily... 🔍")
 		tickLoop:
 			for {
 				select {
@@ -836,7 +839,7 @@ func main() {
 						break tickLoop
 					}
 					hits := countScanHits(logFile)
-					editProgress(remaining, hits, "Scanning... 🔥")
+					editProgress(remaining, hits, "Probing stealthily... 🔍")
 					_ = now
 				case <-time.After(time.Until(deadline)):
 					break tickLoop
@@ -913,6 +916,10 @@ func main() {
 					fmt.Sprintf("✨ *Scan Complete!*\n%s clean resolver IPs found.\nTop 50 exported to `masterdnsvpn_resolvers.toml`.\n\nBoth files sent above.", formatInt(hitCount)),
 					tb.ModeMarkdown,
 				)
+
+				if hitCount == 0 {
+					send("⚠️ 0 hits recorded. Possible causes:\n• Cloud firewall blocking UDP/53 inbound — check your VPS firewall rules\n• EchoCatcher not binding correctly — check: journalctl -u echocatcher -n 50\n• Scattergun rate still too high — try reducing -workers further\n\nRun a quick test: dig @<your-vps-ip> test.yourdomain.com and watch echocatcher logs.")
+				}
 			}
 
 			// Step 6: Restart VPN.
