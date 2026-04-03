@@ -503,6 +503,13 @@ var (
 	scanRunning atomic.Bool // true while a scan is in progress
 )
 
+// pendingDomainPrompts maps a chat ID to a channel that receives the admin's
+// reply when the bot is waiting for a missing scan domain during /update.
+var (
+	pendingDomainMu      sync.Mutex
+	pendingDomainPrompts = make(map[int64]chan string)
+)
+
 // ---------------------------------------------------------------------------
 // Health monitor
 // ---------------------------------------------------------------------------
@@ -1008,6 +1015,52 @@ func main() {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 			defer cancel()
+
+			// ── Domain check ────────────────────────────────────────────────
+			// If scanner.domain is missing from config.yaml, ask the admin
+			// via Telegram before touching the source tree.
+			if cfg.Scanner.Domain == "" {
+				safeSend(destChat, "⚠️ *scanner.domain* is not set in your config.\n\nPlease reply with your scan domain now (e.g. `scan.yourdomain.com`):", tb.ModeMarkdown)
+
+				replyCh := make(chan string, 1)
+				pendingDomainMu.Lock()
+				pendingDomainPrompts[destChat.ID] = replyCh
+				pendingDomainMu.Unlock()
+
+				var newDomain string
+				select {
+				case newDomain = <-replyCh:
+				case <-time.After(2 * time.Minute):
+					safeSend(destChat, "⏱ Timed out waiting for domain. /update cancelled.")
+					return
+				}
+
+				// Patch the in-memory config and write the domain into config.yaml.
+				cfg.Scanner.Domain = newDomain
+				if data, err := os.ReadFile(cfgPath); err == nil {
+					updated := string(data)
+					if strings.Contains(updated, "domain:") {
+						// Replace the existing (empty/placeholder) domain line.
+						lines := strings.Split(updated, "\n")
+						for i, line := range lines {
+							if strings.TrimSpace(line) == "domain:" || strings.HasPrefix(strings.TrimSpace(line), "domain:") {
+								lines[i] = "  domain: \"" + newDomain + "\""
+								break
+							}
+						}
+						updated = strings.Join(lines, "\n")
+					} else {
+						// Append domain under the scanner: section.
+						updated = strings.ReplaceAll(updated, "scanner:", "scanner:\n  domain: \""+newDomain+"\"")
+					}
+					if err := os.WriteFile(cfgPath, []byte(updated), 0o600); err == nil {
+						safeSend(destChat, fmt.Sprintf("✅ Domain `%s` saved to config.yaml.", newDomain), tb.ModeMarkdown)
+					} else {
+						safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not write config.yaml: %v", err))
+					}
+				}
+			}
+
 			srcDir := "/opt/dns-orchestrator/src"
 			// Systemd services do not inherit the login-shell PATH, so
 			// /usr/local/go/bin is missing.  Prepend it explicitly for every
@@ -1051,6 +1104,30 @@ func main() {
 				safeSend(destChat, fmt.Sprintf("\u26a0\ufe0f Binaries updated but restart failed: %v\nRun `sudo systemctl restart orchestrator-bot` manually.", err))
 			}
 		}()
+		return nil
+	})
+
+	// ---- Free-text handler — catches admin replies to domain prompt -----------
+	bot.Handle(tb.OnText, func(c tb.Context) error {
+		if !isAdmin(c) {
+			return nil
+		}
+		pendingDomainMu.Lock()
+		ch, waiting := pendingDomainPrompts[c.Chat().ID]
+		if waiting {
+			delete(pendingDomainPrompts, c.Chat().ID)
+		}
+		pendingDomainMu.Unlock()
+
+		if waiting {
+			domain := strings.TrimSpace(c.Text())
+			if domain == "" {
+				safeSend(c.Chat(), "Domain cannot be empty. /update cancelled.")
+				return nil
+			}
+			ch <- domain
+			return nil
+		}
 		return nil
 	})
 
