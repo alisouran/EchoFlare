@@ -928,8 +928,9 @@ func main() {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 			defer cancel()
-			// Prepend Go binary path so commands like "go build" work from systemd context.
-			cmdWithPath := "export PATH=$PATH:/usr/local/go/bin && " + cmdStr
+			// Prepend Go binary path and required env vars so go/make work from systemd context.
+			const sysEnv = "export PATH=$PATH:/usr/local/go/bin && export HOME=/root && export GOPATH=/root/go && export GOMODCACHE=/root/go/pkg/mod && "
+			cmdWithPath := sysEnv + cmdStr
 			out, execErr := exec.CommandContext(ctx, "bash", "-c", cmdWithPath).CombinedOutput()
 			result := string(out)
 			if execErr != nil {
@@ -981,7 +982,7 @@ func main() {
 			// Systemd services do not inherit the login-shell PATH, so
 			// /usr/local/go/bin is missing.  Prepend it explicitly for every
 			// step that invokes go or make (which calls go internally).
-			const goEnv = "export PATH=$PATH:/usr/local/go/bin && "
+			const goEnv = "export PATH=$PATH:/usr/local/go/bin && export HOME=/root && export GOPATH=/root/go && export GOMODCACHE=/root/go/pkg/mod && "
 			type step struct {
 				label string
 				cmd   string
