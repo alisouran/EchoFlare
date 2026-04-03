@@ -226,6 +226,57 @@ func svcCmd(action, service string) error {
 	return nil
 }
 
+// freePort53 performs an aggressive port-53 liberation sequence:
+//  1. Stops and disables systemd-resolved so it can never reclaim the port.
+//  2. Overwrites /etc/resolv.conf with a static public nameserver so the
+//     VPS retains outbound DNS (required for the Telegram API connection).
+//  3. Force-kills any remaining process holding UDP/53 or TCP/53 via fuser.
+//
+// Each sub-step is logged but never fatal: a partial failure is better than
+// aborting the whole scan — echocatcher will either bind or fail with a clear
+// error message.
+func freePort53(logger *slog.Logger) {
+	// Step 1: stop + disable systemd-resolved.
+	for _, args := range [][]string{
+		{"systemctl", "stop", "systemd-resolved"},
+		{"systemctl", "disable", "systemd-resolved"},
+	} {
+		out, err := exec.Command("sudo", args...).CombinedOutput()
+		if err != nil {
+			// "not found" / "not loaded" are harmless — resolved may not be present.
+			logger.Info("freePort53: systemctl op (may be harmless)",
+				"args", strings.Join(args, " "),
+				"out", strings.TrimSpace(string(out)),
+			)
+		} else {
+			logger.Info("freePort53: ok", "args", strings.Join(args, " "))
+		}
+	}
+
+	// Step 2: write a static resolv.conf so the VPS can still reach Telegram.
+	const staticResolv = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n"
+	if err := os.WriteFile("/etc/resolv.conf", []byte(staticResolv), 0o644); err != nil {
+		logger.Warn("freePort53: could not write /etc/resolv.conf", "err", err)
+	} else {
+		logger.Info("freePort53: /etc/resolv.conf set to 8.8.8.8")
+	}
+
+	// Step 3: force-kill any process still holding port 53.
+	for _, proto := range []string{"udp", "tcp"} {
+		portProto := "53/" + proto
+		out, err := exec.Command("sudo", "fuser", "-k", portProto).CombinedOutput()
+		if err != nil {
+			// fuser exits 1 when no process owns the port — not an error.
+			logger.Info("freePort53: fuser (no owner or killed)",
+				"port", portProto,
+				"out", strings.TrimSpace(string(out)),
+			)
+		} else {
+			logger.Info("freePort53: killed port owner", "port", portProto)
+		}
+	}
+}
+
 func svcStatus(service string) string {
 	out, err := exec.Command("sudo", "systemctl", "is-active", service).Output()
 	if err != nil {
@@ -856,10 +907,15 @@ func main() {
 				return
 			}
 
-			// Brief pause so the OS fully releases port 53 before echocatcher binds.
+			// Step 2: Port-53 liberation — stop systemd-resolved, fix resolv.conf,
+			// force-kill any remaining port-53 squatters.
+			editProgress(dur, "Freeing port 53...")
+			freePort53(logger)
+
+			// Step 3: Brief pause so the OS fully releases port 53.
 			time.Sleep(2 * time.Second)
 
-			// Step 2: Start EchoCatcher.
+			// Step 4: Start EchoCatcher.
 			if err := svcCmd("start", cfg.Services.Scanner); err != nil {
 				errMsg := err.Error()
 				if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "Unit") {
@@ -872,7 +928,7 @@ func main() {
 				return
 			}
 
-			// Step 3: Wait with live progress ticker (edit every 5 s, respect Telegram rate limits).
+			// Step 5: Wait with live progress ticker (edit every 5 s, respect Telegram rate limits).
 			deadline := time.Now().Add(dur)
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
@@ -893,7 +949,7 @@ func main() {
 				}
 			}
 
-			// Step 4: Stop EchoCatcher.
+			// Step 6: Stop EchoCatcher.
 			editProgress(0, "Stopping scanner...")
 			if err := svcCmd("stop", cfg.Services.Scanner); err != nil {
 				logger.Warn("stop scanner error", "err", err)
@@ -968,7 +1024,7 @@ func main() {
 				}
 			}
 
-			// Step 6: Restart VPN.
+			// Step 7: Restart VPN — restores the service's own DNS handling.
 			if err := svcCmd("restart", cfg.Services.VPN); err != nil {
 				send(fmt.Sprintf("⚠️ Failed to restart VPN: %v\nPlease restart it manually!", err))
 				return

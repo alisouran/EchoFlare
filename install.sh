@@ -110,12 +110,36 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \
     sudo \
+    psmisc \
     2>/dev/null
 
 success "System packages ready."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Go installation
+# 3. Permanently disable systemd-resolved so it never squats on port 53
+#    and prevents echocatcher from binding during /scan.
+#    We also write a static /etc/resolv.conf so the VPS retains outbound DNS.
+# ─────────────────────────────────────────────────────────────────────────────
+step "Disabling systemd-resolved (frees port 53 permanently)"
+
+systemctl stop    systemd-resolved 2>/dev/null || true
+systemctl disable systemd-resolved 2>/dev/null || true
+# Masking prevents any future `systemctl start` or dependency from re-enabling it.
+systemctl mask    systemd-resolved 2>/dev/null || true
+
+# Replace the symlink that resolved normally manages with a static file.
+# 8.8.8.8 / 8.8.4.4 give the VPS reliable outbound DNS for Telegram API calls.
+rm -f /etc/resolv.conf
+cat > /etc/resolv.conf <<'EOF'
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+EOF
+chmod 644 /etc/resolv.conf
+
+success "systemd-resolved masked and /etc/resolv.conf set to 8.8.8.8 / 8.8.4.4."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Go installation
 # ─────────────────────────────────────────────────────────────────────────────
 step "Checking Go installation"
 
@@ -157,7 +181,7 @@ fi
 command -v go &>/dev/null || error "Go binary not found in PATH even after install.  Check /usr/local/go/bin."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Source resolution
+# 5. Source resolution
 #    Prefer the current directory if it contains the expected go.mod.
 #    Otherwise clone from REPO_URL.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,7 +204,7 @@ fi
 success "Source at: ${SRC_DIR}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Configuration — detect update vs fresh install
+# 6. Configuration — detect update vs fresh install
 # ─────────────────────────────────────────────────────────────────────────────
 step "Configuration"
 
@@ -240,7 +264,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Write config.yaml  (skipped on updates — backup is restored at step 10)
+# 7. Write config.yaml  (skipped on updates — backup is restored at step 11)
 #    The bot's loadConfig() reads YAML — NOT a .env file.
 # ─────────────────────────────────────────────────────────────────────────────
 step "Writing config.yaml"
@@ -292,7 +316,7 @@ EOF
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Build binaries
+# 8. Build binaries
 # ─────────────────────────────────────────────────────────────────────────────
 step "Building binaries"
 
@@ -316,7 +340,7 @@ success "  ${BOT_BIN}  ($(du -sh "${BOT_BIN}" | cut -f1))"
 success "  ${CATCHER_BIN}  ($(du -sh "${CATCHER_BIN}" | cut -f1))"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Create systemd service for the orchestrator bot
+# 9. Create systemd service for the orchestrator bot
 # ─────────────────────────────────────────────────────────────────────────────
 step "Creating systemd services"
 
@@ -379,8 +403,8 @@ EOF
 success "echocatcher.service written (registered but NOT enabled — bot controls lifecycle via systemctl start/stop)."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. Sudoers — passwordless systemctl for the required services
-#    Uses /etc/sudoers.d/ (drop-in directory, avoids touching /etc/sudoers).
+# 10. Sudoers — passwordless systemctl for the required services
+#     Uses /etc/sudoers.d/ (drop-in directory, avoids touching /etc/sudoers).
 # ─────────────────────────────────────────────────────────────────────────────
 step "Configuring passwordless sudo for systemctl"
 
@@ -399,6 +423,12 @@ root ALL=(ALL) NOPASSWD: /bin/systemctl start masterdnsvpn.service
 root ALL=(ALL) NOPASSWD: /bin/systemctl stop masterdnsvpn.service
 root ALL=(ALL) NOPASSWD: /bin/systemctl restart masterdnsvpn.service
 
+# Port-53 liberation — freePort53() routine executed before each /scan
+root ALL=(ALL) NOPASSWD: /bin/systemctl stop systemd-resolved
+root ALL=(ALL) NOPASSWD: /bin/systemctl disable systemd-resolved
+root ALL=(ALL) NOPASSWD: /usr/bin/fuser -k 53/udp
+root ALL=(ALL) NOPASSWD: /usr/bin/fuser -k 53/tcp
+
 # journalctl — used by /get_logs command
 root ALL=(ALL) NOPASSWD: /usr/bin/journalctl
 EOF
@@ -413,7 +443,7 @@ visudo -c -f "${SUDOERS_FILE}" \
 success "Sudoers rule installed at ${SUDOERS_FILE} (validated OK)."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. Enable and start the orchestrator bot
+# 11. Enable and start the orchestrator bot
 # ─────────────────────────────────────────────────────────────────────────────
 step "Starting ${SERVICE_NAME}"
 
@@ -441,7 +471,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11. Final success banner
+# 12. Final success banner
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
