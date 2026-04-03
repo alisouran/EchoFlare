@@ -2,8 +2,8 @@
 //
 // Usage:
 //
-//	./scattergun -list ips.txt -domain scan.example.com -workers 10 -retries 1 -jitter 150ms
-//	./scattergun -list ips.txt -domain scan.example.com -pad 1000 -qtype TXT
+//	./scattergun -list ips.txt -domain example.com -workers 10 -retries 1 -jitter 150ms
+//	./scattergun -list ips.txt -domain example.com -pad 1000
 //
 // For each IP in the input file, scattergun crafts a DNS query whose QNAME
 // encodes the target IP and a Unix timestamp, then fires it over UDP without
@@ -27,7 +27,9 @@ import (
 	"bufio"
 	"context"
 	crand "crypto/rand"
+	"encoding/base32"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -35,7 +37,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,7 +80,7 @@ func parseFlags() config {
 	flag.IntVar(&cfg.retries, "retries", 1, "Number of UDP sends per IP (to mitigate packet loss)")
 	flag.DurationVar(&cfg.jitter, "jitter", 150*time.Millisecond, "Max random sleep between retries")
 	flag.IntVar(&cfg.pad, "pad", 0, "Inflate DNS packet to this many bytes using EDNS0 Padding (RFC 7830). 0 = disabled. Use -pad 1000 to simulate VPN tunnel traffic.")
-	flag.StringVar(&cfg.qtype, "qtype", "A", `DNS query type: "A" (default), "TXT", or "AAAA". Combine with -pad for realistic DPI simulation.`)
+	flag.StringVar(&cfg.qtype, "qtype", "TXT", `DNS query type: "TXT" (default), "A", or "AAAA". Combine with -pad for realistic DPI simulation.`)
 	flag.BoolVar(&cfg.debug, "debug", false, "Print a [DEBUG] line to stdout for every packet sent (proof-of-life)")
 	flag.StringVar(&cfg.canary, "canary", "", "VPS IP to send a single test packet to directly (bypasses -list). Prints [CANARY] status and exits.")
 	flag.Parse()
@@ -135,36 +136,54 @@ func qtypeToUint16(qtype string) uint16 {
 // QNAME construction
 // ---------------------------------------------------------------------------
 
+// b32enc is the standard RFC 4648 Base32 alphabet without padding characters.
+// Produces uppercase A-Z2-7 output identical to DKIM selector labels, which
+// confounds DPI signatures that flag short high-entropy labels as tunneling.
+var b32enc = base32.StdEncoding.WithPadding(base32.NoPadding)
+
 // buildQNAME returns the fully-qualified DNS name to query for a given raw IP
-// string.  The format encodes the target IP and a Unix timestamp in Base36 so
-// that the resulting labels look like random CDN node identifiers rather than
-// the fixed-length all-hex pattern that DPI systems flag as DNS tunneling.
+// string.  The payload is packed into a fixed 32-byte binary blob and encoded
+// as a single Base32 label (52 uppercase chars), mimicking a DKIM/SPF selector
+// query (e.g. MFRGGZDFMZTWQ2LKNNWG23TPOBYXE3DPEBXXEZLOOQ.yourdomain.com.).
 //
-//	<base36_ip>.<base36_ts>.<domain>.
-//	e.g.  1d1-2h.lncy2g.scan.yourdomain.com.     (IPv4)
-//	      3-1a2b...-...4c5d.lncy2g.scan.yourdomain.com.  (IPv6, hi "-" lo)
+// Payload layout (32 bytes total → 52-char Base32 label, no "=" padding):
+//
+//	IPv4: [0x04][4-byte IP][8-byte TS big-endian][19 random filler bytes]
+//	IPv6: [0x06][16-byte IP][8-byte TS big-endian][7 random filler bytes]
+//
+// The filler bytes make every label unique even for the same IP, defeating
+// any DPI rule that keys on repeated identical labels.
 func buildQNAME(rawIP, domain string) (string, error) {
 	ip := net.ParseIP(strings.TrimSpace(rawIP))
 	if ip == nil {
 		return "", fmt.Errorf("invalid IP address: %q", rawIP)
 	}
 
-	var encodedIP string
+	payload := make([]byte, 32)
+	ts := time.Now().Unix()
+
 	if v4 := ip.To4(); v4 != nil {
-		// IPv4 → uint32 → base36 (max 7 chars, e.g. "2mowkjv" for 255.255.255.255)
-		ipInt := binary.BigEndian.Uint32(v4)
-		encodedIP = strconv.FormatUint(uint64(ipInt), 36)
+		payload[0] = 0x04
+		copy(payload[1:5], v4)
+		binary.BigEndian.PutUint64(payload[5:13], uint64(ts))
+		// bytes 13–31: 19 random filler bytes
+		if _, err := crand.Read(payload[13:]); err != nil {
+			return "", fmt.Errorf("rand filler: %w", err)
+		}
 	} else {
-		// IPv6 → two uint64 halves in base36, joined by "-" (DNS-label-safe separator)
 		b := ip.To16()
-		hi := binary.BigEndian.Uint64(b[:8])
-		lo := binary.BigEndian.Uint64(b[8:])
-		encodedIP = strconv.FormatUint(hi, 36) + "-" + strconv.FormatUint(lo, 36)
+		payload[0] = 0x06
+		copy(payload[1:17], b)
+		binary.BigEndian.PutUint64(payload[17:25], uint64(ts))
+		// bytes 25–31: 7 random filler bytes
+		if _, err := crand.Read(payload[25:]); err != nil {
+			return "", fmt.Errorf("rand filler: %w", err)
+		}
 	}
 
-	ts := time.Now().Unix()
+	label := b32enc.EncodeToString(payload) // always 52 chars, uppercase, no "="
 	// dns.Fqdn appends the trailing dot required by the DNS wire format.
-	return dns.Fqdn(fmt.Sprintf("%s.%s.%s", encodedIP, strconv.FormatInt(ts, 36), domain)), nil
+	return dns.Fqdn(fmt.Sprintf("%s.%s", label, domain)), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -211,15 +230,27 @@ func buildMsg(qname string, qtype uint16, padBytes int) ([]byte, error) {
 		opt.Option = append(opt.Option, pad)
 		m.Extra = append(m.Extra, opt)
 	} else {
-		// Always include a baseline EDNS0 OPT record even without padding.
-		// Public resolvers (e.g. 8.8.8.8) expect EDNS0 from well-behaved clients;
-		// omitting it can cause resolvers to silently drop or truncate responses.
-		// 1232 bytes is the recommended minimum EDNS0 buffer size (RFC 6891 / DNS
-		// Flag Day 2020) and matches what MasterDnsVPN and modern stub resolvers send.
+		// Baseline EDNS0 OPT record mimicking a modern stub resolver (systemd-resolved,
+		// bind9, Chrome).  Three details matter to DPI:
+		//   UDPSize=4096   — the value sent by Chrome, Firefox, unbound, systemd-resolved.
+		//   EDNS COOKIE    — Option 10 (RFC 7873): 8-byte random client cookie.
+		//                    Its presence is the single strongest indicator of a real
+		//                    well-behaved stub resolver; bare OPT with RDLEN=0 is a
+		//                    known hand-rolled-client fingerprint.
 		o := new(dns.OPT)
 		o.Hdr.Name = "."
 		o.Hdr.Rrtype = dns.TypeOPT
-		o.SetUDPSize(1232)
+		o.SetUDPSize(4096)
+
+		var cookieBytes [8]byte
+		if _, err := crand.Read(cookieBytes[:]); err == nil {
+			cookie := &dns.EDNS0_COOKIE{
+				Code:   dns.EDNS0COOKIE,
+				Cookie: hex.EncodeToString(cookieBytes[:]),
+			}
+			o.Option = append(o.Option, cookie)
+		}
+
 		m.Extra = append(m.Extra, o)
 	}
 

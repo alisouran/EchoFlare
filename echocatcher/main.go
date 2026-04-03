@@ -27,6 +27,7 @@ package main
 
 import (
 	"context"
+	"encoding/base32"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -35,7 +36,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -148,50 +148,52 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 			if !strings.HasSuffix(qname, strings.ToLower(suffix)) {
 				logger.Info("dns_raw_packet",
 					"name", q.Name,
+					"qtype", dns.TypeToString[q.Qtype],
 					"forwarder", forwarderIP,
 					"payload_bytes", payloadBytes,
 				)
-				// Still add the dummy A record so the reply is well-formed.
-				m.Answer = append(m.Answer, dummyA(q.Name))
+				m.Answer = append(m.Answer, replyRR(q))
 				continue
 			}
 
-			// Strip the domain suffix to get "<hexip>.<timestamp>".
-			inner := strings.TrimSuffix(qname, strings.ToLower(suffix))
-			// inner may still have a trailing dot if it was the zone apex —
-			// trim it defensively.
-			inner = strings.TrimSuffix(inner, ".")
-
-			parts := strings.Split(inner, ".")
-			if len(parts) < 2 {
-				logger.Warn("malformed qname (too few labels)",
+			// Only structured dns_hit logging for TXT queries (the DPI-evading
+			// default).  Other qtypes are still logged as dns_raw_packet so
+			// canary tests with explicit -qtype A still produce visible output.
+			if q.Qtype != dns.TypeTXT {
+				logger.Info("dns_raw_packet",
 					"name", q.Name,
-					"inner", inner,
+					"qtype", dns.TypeToString[q.Qtype],
 					"forwarder", forwarderIP,
+					"payload_bytes", payloadBytes,
+					"note", "non-TXT qtype; use -qtype TXT for structured logging",
 				)
-				m.Answer = append(m.Answer, dummyA(q.Name))
+				m.Answer = append(m.Answer, replyRR(q))
 				continue
 			}
 
-			encodedIP := parts[0]
-			tsStr := parts[1]
+			// Strip the domain suffix to isolate the 52-char Base32 label.
+			inner := strings.TrimSuffix(qname, strings.ToLower(suffix))
+			inner = strings.TrimSuffix(inner, ".") // remove any trailing dot
 
-			// ---- Decode target IP from base36 --------------------------------
-			targetIP := decodeBase36IP(encodedIP, logger)
+			// The label is the first (and only) component before the domain.
+			// Split defensively but we expect exactly one label.
+			parts := strings.Split(inner, ".")
+			label := parts[0]
 
-			// ---- Decode timestamp and compute latency ------------------------
-			var latencySec int64
-			// scattergun encodes the timestamp in base36 (e.g. "lncy2g").
-			ts, err := strconv.ParseInt(tsStr, 36, 64)
+			// ---- Decode Base32 payload → target IP + timestamp --------------
+			targetIP, ts, err := decodeBase32Payload(label)
 			if err != nil {
-				logger.Warn("timestamp parse error",
-					"ts_raw", tsStr,
+				logger.Warn("base32 decode error",
+					"label", label,
 					"name", q.Name,
+					"forwarder", forwarderIP,
 					"err", err,
 				)
-			} else {
-				latencySec = time.Now().Unix() - ts
+				m.Answer = append(m.Answer, replyRR(q))
+				continue
 			}
+
+			latencySec := time.Now().Unix() - ts
 
 			// ---- Log the successful resolver hit ----------------------------
 			queryCount.Add(1)
@@ -204,7 +206,7 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 				"time", time.Now().UTC().Format(time.RFC3339),
 			)
 
-			m.Answer = append(m.Answer, dummyA(q.Name))
+			m.Answer = append(m.Answer, replyRR(q))
 		}
 
 		if err := w.WriteMsg(m); err != nil {
@@ -216,43 +218,65 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 	}
 }
 
-// decodeBase36IP converts a base36-encoded IP string back to dotted/colon notation.
-// IPv4 is a single base36 uint32 label (e.g. "1d1b2h").
-// IPv6 is two base36 uint64 halves joined by "-" (e.g. "3abc...-...4def...").
-// Returns "<decode-error>" on failure and logs a warning.
-func decodeBase36IP(encoded string, logger *slog.Logger) string {
-	if strings.Contains(encoded, "-") {
-		// IPv6 — two base36 uint64 halves separated by "-"
-		halves := strings.SplitN(encoded, "-", 2)
-		hi, err1 := strconv.ParseUint(halves[0], 36, 64)
-		lo, err2 := strconv.ParseUint(halves[1], 36, 64)
-		if err1 != nil || err2 != nil {
-			logger.Warn("base36 ipv6 decode error", "encoded", encoded)
-			return "<decode-error>"
-		}
-		b := make([]byte, 16)
-		binary.BigEndian.PutUint64(b[:8], hi)
-		binary.BigEndian.PutUint64(b[8:], lo)
-		return net.IP(b).String()
-	}
-	// IPv4 — single base36 uint32
-	ipInt, err := strconv.ParseUint(encoded, 36, 32)
+// b32dec is the standard RFC 4648 Base32 decoder without padding.
+// Matches the encoder used in scattergun's buildQNAME.
+var b32dec = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// decodeBase32Payload decodes a 52-char Base32 label produced by scattergun
+// back into the target IP string and Unix timestamp.
+//
+// Expected payload layout (32 bytes):
+//
+//	IPv4: [0x04][4-byte IP][8-byte TS big-endian][19 random filler]
+//	IPv6: [0x06][16-byte IP][8-byte TS big-endian][7 random filler]
+func decodeBase32Payload(label string) (targetIP string, ts int64, err error) {
+	payload, err := b32dec.DecodeString(strings.ToUpper(label))
 	if err != nil {
-		logger.Warn("base36 ipv4 decode error", "encoded", encoded, "err", err)
-		return "<decode-error>"
+		return "", 0, fmt.Errorf("base32 decode: %w", err)
 	}
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, uint32(ipInt))
-	return net.IP(b).String()
+	if len(payload) < 13 {
+		return "", 0, fmt.Errorf("payload too short: %d bytes", len(payload))
+	}
+
+	switch payload[0] {
+	case 0x04:
+		if len(payload) < 13 {
+			return "", 0, fmt.Errorf("IPv4 payload too short")
+		}
+		ip := net.IP(payload[1:5])
+		ts = int64(binary.BigEndian.Uint64(payload[5:13]))
+		return ip.String(), ts, nil
+	case 0x06:
+		if len(payload) < 25 {
+			return "", 0, fmt.Errorf("IPv6 payload too short")
+		}
+		ip := net.IP(payload[1:17])
+		ts = int64(binary.BigEndian.Uint64(payload[17:25]))
+		return ip.String(), ts, nil
+	default:
+		return "", 0, fmt.Errorf("unknown type byte: 0x%02x", payload[0])
+	}
 }
 
-// dummyA returns a minimal A record pointing to 1.2.3.4 with a 60-second TTL.
-// Returning a real answer (rather than NOERROR with no records) causes
-// resolvers to cache the result and not retry, keeping the network quiet.
-func dummyA(qname string) *dns.A {
+// replyRR returns a well-formed answer record appropriate for the query type.
+// For TXT queries it returns a plausible SPF record (TTL 300) so the reply
+// looks like an authoritative SPF/DKIM response and resolvers cache it.
+// For all other types it falls back to a dummy A record (1.2.3.4, TTL 60).
+func replyRR(q dns.Question) dns.RR {
+	if q.Qtype == dns.TypeTXT {
+		return &dns.TXT{
+			Hdr: dns.RR_Header{
+				Name:   q.Name,
+				Rrtype: dns.TypeTXT,
+				Class:  dns.ClassINET,
+				Ttl:    300,
+			},
+			Txt: []string{"v=spf1 -all"},
+		}
+	}
 	return &dns.A{
 		Hdr: dns.RR_Header{
-			Name:   qname,
+			Name:   q.Name,
 			Rrtype: dns.TypeA,
 			Class:  dns.ClassINET,
 			Ttl:    60,
