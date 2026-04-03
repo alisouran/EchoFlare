@@ -928,7 +928,9 @@ func main() {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 			defer cancel()
-			out, execErr := exec.CommandContext(ctx, "bash", "-c", cmdStr).CombinedOutput()
+			// Prepend Go binary path so commands like "go build" work from systemd context.
+			cmdWithPath := "export PATH=$PATH:/usr/local/go/bin && " + cmdStr
+			out, execErr := exec.CommandContext(ctx, "bash", "-c", cmdWithPath).CombinedOutput()
 			result := string(out)
 			if execErr != nil {
 				result += "\n\n[exit error]: " + execErr.Error()
@@ -976,6 +978,10 @@ func main() {
 			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 			defer cancel()
 			srcDir := "/opt/dns-orchestrator/src"
+			// Systemd services do not inherit the login-shell PATH, so
+			// /usr/local/go/bin is missing.  Prepend it explicitly for every
+			// step that invokes go or make (which calls go internally).
+			const goEnv = "export PATH=$PATH:/usr/local/go/bin && "
 			type step struct {
 				label string
 				cmd   string
@@ -983,8 +989,8 @@ func main() {
 			steps := []step{
 				{"git fetch", "git -C " + srcDir + " fetch origin"},
 				{"git reset", "git -C " + srcDir + " reset --hard origin/master"},
-				{"go mod tidy", "cd " + srcDir + " && go mod tidy"},
-				{"make build-all", "cd " + srcDir + " && make build-all"},
+				{"go mod tidy", goEnv + "cd " + srcDir + " && go mod tidy"},
+				{"make build-all", goEnv + "cd " + srcDir + " && make build-all"},
 			}
 			for _, s := range steps {
 				out, err := exec.CommandContext(ctx, "bash", "-c", s.cmd).CombinedOutput()
