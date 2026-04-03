@@ -994,17 +994,24 @@ func main() {
 				{"make build-all", goEnv + "cd " + srcDir + " && make build-all"},
 			}
 			for _, s := range steps {
+				// Notify before each step so the admin sees live progress.
+				safeSend(destChat, fmt.Sprintf("\u23f3 Running: *%s*...", s.label), tb.ModeMarkdown)
 				out, err := exec.CommandContext(ctx, "bash", "-c", s.cmd).CombinedOutput()
 				if err != nil {
-					msg := fmt.Sprintf("\u274c Update failed at *%s*:\n```\n%s\n%s\n```",
-						s.label, s.cmd, strings.TrimSpace(string(out)))
+					outStr := strings.TrimSpace(string(out))
+					if outStr == "" {
+						outStr = "(no output)"
+					}
+					msg := fmt.Sprintf("\u274c Update failed at *%s*:\n```\n%s\n```",
+						s.label, outStr)
 					if _, sendErr := bot.Send(destChat, msg, tb.ModeMarkdown); sendErr != nil {
-						safeSend(destChat, fmt.Sprintf("\u274c Update failed at %s: %v\n%s", s.label, err, string(out)))
+						safeSend(destChat, fmt.Sprintf("\u274c Update failed at %s: %v\n%s", s.label, err, outStr))
 					}
 					return
 				}
+				safeSend(destChat, fmt.Sprintf("\u2705 *%s* done.", s.label), tb.ModeMarkdown)
 			}
-			safeSend(destChat, "\u2705 Update compiled successfully. Re-launching services now. I'll be back in a few seconds!")
+			safeSend(destChat, "\u2705 All steps complete. Re-launching services now. I'll be back in a few seconds!")
 			if err := exec.Command("sudo", "systemctl", "restart", "orchestrator-bot").Start(); err != nil {
 				logger.Error("update: restart error", "err", err)
 				safeSend(destChat, fmt.Sprintf("\u26a0\ufe0f Binaries updated but restart failed: %v\nRun `sudo systemctl restart orchestrator-bot` manually.", err))
