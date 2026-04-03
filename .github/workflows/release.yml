@@ -49,7 +49,7 @@ jobs:
             binary: scattergun.exe
             buildflags: ""
 
-          - name: android-arm64
+          - name: termux-arm64
             goos: linux
             goarch: arm64
             binary: scattergun
@@ -190,7 +190,7 @@ jobs:
             | macOS Intel | `EchoFlare-Client-darwin-amd64.zip` |
             | macOS Apple Silicon | `EchoFlare-Client-darwin-arm64.zip` |
             | Windows x86-64 | `EchoFlare-Client-windows-amd64.zip` |
-            | Android (Termux) | `EchoFlare-Client-android-arm64.zip` |
+            | Termux (Android) | `EchoFlare-Client-termux-arm64.zip` |
 
             ### 🖥️ Server (EchoCatcher + Bot) — deploy on your VPS
             | Platform | File |
