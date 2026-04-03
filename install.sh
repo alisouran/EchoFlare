@@ -13,8 +13,8 @@
 #   # From the project root:
 #   sudo bash install.sh
 #
-#   # Or as a one-liner (set REPO_URL below first):
-#   curl -sSL https://raw.githubusercontent.com/USERNAME/REPO/main/install.sh | sudo bash
+#   # Or as a one-liner:
+#   bash <(curl -sSL https://raw.githubusercontent.com/alisouran/EchoFlare/master/install.sh)
 #
 # Requirements: Ubuntu 20.04+ / Debian 11+ with apt, curl, and internet access.
 
@@ -32,7 +32,7 @@ readonly CATCHER_BIN="/usr/local/bin/echocatcher"
 readonly SERVICE_NAME="orchestrator-bot"
 readonly SUDOERS_FILE="/etc/sudoers.d/orchestrator-bot"
 readonly GO_MIN_VERSION="1.22"
-readonly REPO_URL="https://github.com/USERNAME/REPO.git"   # ← change this
+readonly REPO_URL="https://github.com/alisouran/EchoFlare.git"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ANSI colour codes
@@ -165,22 +165,16 @@ step "Locating source code"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ -f "${SCRIPT_DIR}/go.mod" ]] && grep -q 'module github.com/user/scattergun' "${SCRIPT_DIR}/go.mod"; then
-    SRC_DIR="${SCRIPT_DIR}"
-    success "Building from current directory: ${SRC_DIR}"
+SRC_DIR="/opt/dns-orchestrator/src"
+if [[ -d "${SRC_DIR}/.git" ]]; then
+    info "Repository already cloned — pulling latest..."
+    git -C "${SRC_DIR}" pull --ff-only
 else
-    # Curl-pipe install: script has no BASH_SOURCE, fall back to clone.
-    SRC_DIR="${INSTALL_DIR}/src"
-    if [[ -d "${SRC_DIR}/.git" ]]; then
-        info "Repository already cloned — pulling latest..."
-        git -C "${SRC_DIR}" pull --ff-only
-    else
-        info "Cloning repository to ${SRC_DIR}..."
-        mkdir -p "${SRC_DIR}"
-        git clone "${REPO_URL}" "${SRC_DIR}"
-    fi
-    success "Source at: ${SRC_DIR}"
+    info "Cloning repository to ${SRC_DIR}..."
+    mkdir -p "${SRC_DIR}"
+    git clone https://github.com/alisouran/EchoFlare.git "${SRC_DIR}"
 fi
+success "Source at: ${SRC_DIR}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Interactive configuration
