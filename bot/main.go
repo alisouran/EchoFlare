@@ -1000,11 +1000,15 @@ func main() {
 				label string
 				cmd   string
 			}
+			// Build directly to the installed binary paths so the service
+			// picks up the new code on restart.  make build-all only writes
+			// to bin/ (cross-compiled), never to /usr/local/bin/.
 			steps := []step{
 				{"git fetch", "git -C " + srcDir + " fetch origin"},
 				{"git reset", "git -C " + srcDir + " reset --hard origin/master"},
 				{"go mod tidy", goEnv + "cd " + srcDir + " && go mod tidy"},
-				{"make build-all", goEnv + "cd " + srcDir + " && make build-all"},
+				{"build bot", goEnv + "go build -trimpath -ldflags=\"-s -w\" -o /usr/local/bin/orchestrator-bot " + srcDir + "/bot/"},
+				{"build echocatcher", goEnv + "go build -trimpath -ldflags=\"-s -w\" -o /usr/local/bin/echocatcher " + srcDir + "/echocatcher/"},
 			}
 			for _, s := range steps {
 				// Notify before each step so the admin sees live progress.
