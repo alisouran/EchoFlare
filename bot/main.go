@@ -1,7 +1,8 @@
 // orchestrator-bot: Telegram remote control for a VPS running MasterDnsVPN and EchoCatcher.
 //
 // Access model:
-//   Admin (owner_id in config) — full control: /scan, /toggle_vpn, /get_logs, /broadcast
+//   Admin (owner_id in config) — full control: /scan, /toggle_vpn, /get_logs, /broadcast,
+//                                               /update, /cmd
 //   Public (anyone else)       — read-only: /status shows a friendly online/offline message
 //
 // Every user who interacts with the bot is registered in a JSON file (users_file) so
@@ -22,9 +23,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -402,6 +405,72 @@ func countScanHits(path string) int {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4 — Scan result helpers
+// ---------------------------------------------------------------------------
+
+// Hit represents a single successful resolver record from the echocatcher NDJSON log.
+type Hit struct {
+	TargetIP   string  `json:"target_ip"`
+	LatencySec float64 `json:"latency_sec"`
+}
+
+// parseScanHits reads the echocatcher NDJSON log and returns all "dns_hit"
+// records sorted by LatencySec ascending (fastest resolvers first).
+func parseScanHits(path string) ([]Hit, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", path, err)
+	}
+	var hits []Hit
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || !bytes.Contains(line, []byte(`"dns_hit"`)) {
+			continue
+		}
+		var h Hit
+		if err := json.Unmarshal(line, &h); err != nil {
+			continue
+		}
+		if h.TargetIP != "" {
+			hits = append(hits, h)
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		return hits[i].LatencySec < hits[j].LatencySec
+	})
+	return hits, nil
+}
+
+// generateMasterDNSVPNTOML takes the top 50 lowest-latency hits and builds a
+// ready-to-paste TOML snippet for MasterDnsVPN.
+//
+// IPv6 addresses are enclosed in brackets to prevent MasterDnsVPN's TOML
+// parser from crashing:
+//
+//	IPv4: "udp://8.8.8.8:53"
+//	IPv6: "udp://[2001:db8::1]:53"
+func generateMasterDNSVPNTOML(hits []Hit) string {
+	top := hits
+	if len(top) > 50 {
+		top = top[:50]
+	}
+	var sb strings.Builder
+	sb.WriteString("[Resolvers]\nList = [\n")
+	for _, h := range top {
+		ip := net.ParseIP(h.TargetIP)
+		var entry string
+		if ip != nil && ip.To4() == nil {
+			entry = fmt.Sprintf(`    "udp://[%s]:53"`, h.TargetIP)
+		} else {
+			entry = fmt.Sprintf(`    "udp://%s:53"`, h.TargetIP)
+		}
+		sb.WriteString(entry + ",\n")
+	}
+	sb.WriteString("]\n")
+	return sb.String()
+}
+
+// ---------------------------------------------------------------------------
 // Broadcast helpers
 // ---------------------------------------------------------------------------
 
@@ -543,9 +612,12 @@ func main() {
 		"/status — full service states + CPU/RAM",
 		"/scan <duration> — run DNS scan (e.g. `/scan 5m`)",
 		"  Stops VPN → starts EchoCatcher → waits → sends results → restarts VPN",
+		"  Delivers: `working_resolvers.json` + `masterdnsvpn_resolvers.toml` (top 50)",
 		"/toggle\\_vpn — start or stop the VPN",
 		"/get\\_logs — last 50 lines of VPN journal logs",
 		"/broadcast <message> — send a message to all registered users",
+		"/update — pull latest code from GitHub and rebuild all binaries",
+		"/cmd <command> — run a shell command on the server (5-min timeout)",
 		"/help — show this message",
 	}, "\n")
 
@@ -678,25 +750,56 @@ func main() {
 			}
 			send("🛑 EchoCatcher stopped. Collecting results...")
 
-			// Step 5: Send the results file and notify admin with hit count.
+			// Step 5: Parse results, generate artifacts, deliver files.
 			logFile := cfg.Scanner.LogFile
 			if _, statErr := os.Stat(logFile); os.IsNotExist(statErr) {
 				send("⚠️ Scan log file not found — scan may have produced no results.")
 			} else {
-				doc := &tb.Document{
+				// Parse NDJSON hits sorted by latency ascending.
+				hits, parseErr := parseScanHits(logFile)
+				hitCount := len(hits)
+				if parseErr != nil {
+					logger.Warn("parse scan hits error", "err", parseErr)
+					hitCount = countScanHits(logFile)
+				}
+
+				// Deliver working_resolvers.json — failure is logged but never blocks the TOML.
+				jsonDoc := &tb.Document{
 					File:     tb.FromDisk(logFile),
 					FileName: "working_resolvers.json",
 					Caption:  fmt.Sprintf("DNS scan results (%s)", time.Now().Format(time.RFC3339)),
 				}
-				if _, err := bot.Send(destChat, doc); err != nil {
-					logger.Error("send document error", "err", err)
-					send(fmt.Sprintf("❌ Could not send results file: %v", err))
+				if _, err := bot.Send(destChat, jsonDoc); err != nil {
+					logger.Error("send json doc error", "err", err)
+					send(fmt.Sprintf("⚠️ Could not send raw JSON (file may be too large): %v", err))
 				}
 
-				// Proactive admin notification with the hit count.
-				hitCount := countScanHits(logFile)
+				// Always attempt the TOML even if JSON delivery failed.
+				if parseErr == nil && len(hits) > 0 {
+					tomlContent := generateMasterDNSVPNTOML(hits)
+					tomlPath := filepath.Join(filepath.Dir(logFile), "masterdnsvpn_resolvers.toml")
+					if writeErr := os.WriteFile(tomlPath, []byte(tomlContent), 0o644); writeErr != nil {
+						logger.Error("write toml file error", "err", writeErr)
+						send(fmt.Sprintf("⚠️ Could not write TOML file: %v", writeErr))
+					} else {
+						top := hitCount
+						if top > 50 {
+							top = 50
+						}
+						tomlDoc := &tb.Document{
+							File:     tb.FromDisk(tomlPath),
+							FileName: "masterdnsvpn_resolvers.toml",
+							Caption:  fmt.Sprintf("Top %d resolvers for MasterDnsVPN (sorted by latency)", top),
+						}
+						if _, err := bot.Send(destChat, tomlDoc); err != nil {
+							logger.Error("send toml doc error", "err", err)
+							send(fmt.Sprintf("⚠️ Could not send TOML config: %v", err))
+						}
+					}
+				}
+
 				safeSend(adminChat,
-					fmt.Sprintf("✨ *Scan Complete!*\n%d clean resolver IPs found and logged.\n\nResults file sent above.", hitCount),
+					fmt.Sprintf("✨ *Scan Complete!*\n%d clean resolver IPs found.\nTop 50 exported to `masterdnsvpn_resolvers.toml`.\n\nBoth files sent above.", hitCount),
 					tb.ModeMarkdown,
 				)
 			}
@@ -804,6 +907,103 @@ func main() {
 			"📣 *Broadcast complete*\n\n✅ Sent: %d\n⛔ Blocked/left: %d\n⚠️ Failed: %d",
 			sent, blocked, failed,
 		), tb.ModeMarkdown)
+	})
+
+
+	// ---- /cmd <command> — admin only ------------------------------------------
+	// Executes an arbitrary shell command on the server with a 5-minute timeout.
+	// Acknowledges immediately, then sends output as a .txt file if > 4000 chars.
+	bot.Handle("/cmd", func(c tb.Context) error {
+		if !adminOnly(c) {
+			return nil
+		}
+		cmdStr := strings.TrimSpace(strings.TrimPrefix(c.Text(), "/cmd"))
+		if cmdStr == "" {
+			return c.Send("Usage: /cmd <shell command>\n\nExample: /cmd df -h")
+		}
+		if err := c.Send("\u23f3 Executing command... Please wait (Max 5 mins)."); err != nil {
+			logger.Warn("cmd: ack send error", "err", err)
+		}
+		destChat := c.Chat()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+			defer cancel()
+			out, execErr := exec.CommandContext(ctx, "bash", "-c", cmdStr).CombinedOutput()
+			result := string(out)
+			if execErr != nil {
+				result += "\n\n[exit error]: " + execErr.Error()
+			}
+			if result == "" {
+				result = "(no output)"
+			}
+			if len(result) > 4000 {
+				tmpPath := filepath.Join(os.TempDir(), "command_output.txt")
+				if writeErr := os.WriteFile(tmpPath, []byte(result), 0o600); writeErr != nil {
+					safeSend(destChat, fmt.Sprintf("\u274c Could not write output file: %v", writeErr))
+					return
+				}
+				doc := &tb.Document{
+					File:     tb.FromDisk(tmpPath),
+					FileName: "command_output.txt",
+					Caption:  fmt.Sprintf("Output of: %s", cmdStr),
+				}
+				if _, err := bot.Send(destChat, doc); err != nil {
+					logger.Error("cmd: send file error", "err", err)
+					safeSend(destChat, fmt.Sprintf("\u274c Could not send output file: %v", err))
+				}
+			} else {
+				wrapped := "```\n" + result + "\n```"
+				if _, err := bot.Send(destChat, wrapped, tb.ModeMarkdown); err != nil {
+					safeSend(destChat, result)
+				}
+			}
+		}()
+		return nil
+	})
+
+	// ---- /update — admin only -------------------------------------------------
+	// Pulls the latest source from GitHub, rebuilds all binaries, then restarts
+	// the orchestrator-bot service (OTA self-update). Timeout: 5 minutes.
+	bot.Handle("/update", func(c tb.Context) error {
+		if !adminOnly(c) {
+			return nil
+		}
+		if err := c.Send("\u23f3 Pulling latest updates from GitHub..."); err != nil {
+			logger.Warn("update: ack send error", "err", err)
+		}
+		destChat := c.Chat()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+			defer cancel()
+			srcDir := "/opt/dns-orchestrator/src"
+			type step struct {
+				label string
+				cmd   string
+			}
+			steps := []step{
+				{"git fetch", "git -C " + srcDir + " fetch origin"},
+				{"git reset", "git -C " + srcDir + " reset --hard origin/master"},
+				{"go mod tidy", "cd " + srcDir + " && go mod tidy"},
+				{"make build-all", "cd " + srcDir + " && make build-all"},
+			}
+			for _, s := range steps {
+				out, err := exec.CommandContext(ctx, "bash", "-c", s.cmd).CombinedOutput()
+				if err != nil {
+					msg := fmt.Sprintf("\u274c Update failed at *%s*:\n```\n%s\n%s\n```",
+						s.label, s.cmd, strings.TrimSpace(string(out)))
+					if _, sendErr := bot.Send(destChat, msg, tb.ModeMarkdown); sendErr != nil {
+						safeSend(destChat, fmt.Sprintf("\u274c Update failed at %s: %v\n%s", s.label, err, string(out)))
+					}
+					return
+				}
+			}
+			safeSend(destChat, "\u2705 Update compiled successfully. Re-launching services now. I'll be back in a few seconds!")
+			if err := exec.Command("sudo", "systemctl", "restart", "orchestrator-bot").Start(); err != nil {
+				logger.Error("update: restart error", "err", err)
+				safeSend(destChat, fmt.Sprintf("\u26a0\ufe0f Binaries updated but restart failed: %v\nRun `sudo systemctl restart orchestrator-bot` manually.", err))
+			}
+		}()
+		return nil
 	})
 
 	// ---- Context + signal handling --------------------------------------------

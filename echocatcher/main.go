@@ -7,6 +7,14 @@
 // echocatcher decodes the original target IP, computes delivery latency, and
 // logs a structured JSON record.
 //
+// Phase 3 — Payload Sieve:
+//
+//	Each log record now includes "payload_bytes": the raw wire size of the
+//	incoming UDP DNS message.  When scattergun is run with -pad 1000, a
+//	successful hit with payload_bytes ≥ 1000 proves the resolver can route
+//	large UDP/53 packets through the ISP's DPI layer — exactly the condition
+//	required for a real DNS tunnel (e.g. MasterDnsVPN) to function.
+//
 // Usage:
 //
 //	./echocatcher -domain scan.example.com -log results.json -bind 0.0.0.0:53
@@ -87,8 +95,9 @@ func newLogger(logPath string) (*slog.Logger, *os.File, error) {
 // makeHandler returns a dns.HandlerFunc that:
 //  1. Extracts the forwarder IP (the resolver that forwarded the probe query).
 //  2. Parses the QNAME to recover the original target IP and probe timestamp.
-//  3. Logs a structured JSON record via slog.
-//  4. Always replies with a dummy A record (1.2.3.4, TTL 60) so the resolver
+//  3. Records the total wire size of the incoming UDP packet (payload_bytes).
+//  4. Logs a structured JSON record via slog.
+//  5. Always replies with a dummy A record (1.2.3.4, TTL 60) so the resolver
 //     caches the answer and does not re-query, keeping the network quiet.
 func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) dns.HandlerFunc {
 	// Build the expected suffix once.  Both the leading dot and the trailing
@@ -97,6 +106,11 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 	suffix := "." + dns.Fqdn(domain)
 
 	return func(w dns.ResponseWriter, r *dns.Msg) {
+		// Phase 3: capture the total wire size of the incoming DNS message.
+		// r.Len() returns the packed byte count of the message as received,
+		// including any EDNS0 OPT records (and padding) added by scattergun.
+		payloadBytes := r.Len()
+
 		// Identify the resolver that forwarded the query to us.
 		forwarderAddr := w.RemoteAddr().String()
 		forwarderIP, _, err := net.SplitHostPort(forwarderAddr)
@@ -169,6 +183,7 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 				"target_ip", targetIP,
 				"forwarder_ip", forwarderIP,
 				"latency_sec", latencySec,
+				"payload_bytes", payloadBytes,
 				"query", q.Name,
 				"time", time.Now().UTC().Format(time.RFC3339),
 			)

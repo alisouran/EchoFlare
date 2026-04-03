@@ -167,8 +167,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SRC_DIR="/opt/dns-orchestrator/src"
 if [[ -d "${SRC_DIR}/.git" ]]; then
-    info "Repository already cloned — pulling latest..."
-    git -C "${SRC_DIR}" pull --ff-only
+    info "Repository already cloned — fetching latest from origin..."
+    # Use fetch + reset --hard so local divergence (e.g. a failed previous
+    # update that left uncommitted changes) never blocks the update.
+    git -C "${SRC_DIR}" fetch origin
+    git -C "${SRC_DIR}" reset --hard origin/master
 else
     info "Cloning repository to ${SRC_DIR}..."
     mkdir -p "${SRC_DIR}"
@@ -362,7 +365,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-success "echocatcher.service written (not enabled — bot controls lifecycle)."
+success "echocatcher.service written (registered but NOT enabled — bot controls lifecycle via systemctl start/stop)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. Sudoers — passwordless systemctl for the required services

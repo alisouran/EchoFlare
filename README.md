@@ -221,16 +221,40 @@ You'll see a live progress counter. Let it run through your full resolver list.
 
 Wait for the timer to complete (5 minutes in this example). The bot will automatically:
 - Stop EchoCatcher
-- Package the results
-- Send you the `working_resolvers.json` file directly in Telegram
+- Parse and sort all hits by latency
+- Send `working_resolvers.json` (every raw hit)
+- Send `masterdnsvpn_resolvers.toml` (top 50 fastest resolvers, ready to paste)
 - Restart your VPN
 
 ```
-Bot: 📎 working_resolvers.json — 1,247 resolver hits
-Bot: ✅ Scan complete! VPN has been restarted.
+Bot: 📎 working_resolvers.json  ← all resolver hits with latency data
+Bot: 📎 masterdnsvpn_resolvers.toml  ← top 50 for MasterDnsVPN
+Bot: ✨ Scan Complete! 1,247 clean resolver IPs found. Top 50 exported.
+Bot: ✅ VPN restarted. Scan lifecycle complete.
 ```
 
-Open `working_resolvers.json` — every entry is a resolver that successfully relayed a probe through the firewall, complete with latency data.
+### Phase 4 — MasterDnsVPN Auto-Integration
+
+The bot does the heavy lifting for you. After every scan it:
+
+1. Parses all `dns_hit` records from the NDJSON log
+2. Sorts them by `latency_sec` (lowest first)
+3. Takes the top 50 and generates a ready-to-paste TOML config
+
+**Example `masterdnsvpn_resolvers.toml` output:**
+
+```toml
+[Resolvers]
+List = [
+    "udp://8.8.8.8:53",
+    "udp://1.1.1.1:53",
+    "udp://[2001:db8::1]:53",
+]
+```
+
+IPv6 addresses are automatically enclosed in brackets (`[...]`) so MasterDnsVPN's TOML parser never crashes. Just copy the file into your MasterDnsVPN config directory and restart the service.
+
+The raw `working_resolvers.json` is always sent first. If it is too large for Telegram's upload limit, the bot logs a warning and still sends the TOML — you never lose your config.
 
 ---
 
@@ -242,11 +266,13 @@ The Orchestrator Bot is your remote control. It handles the Port 53 hand-off aut
 
 | Command | What it does |
 |---|---|
-| `/scan <duration>` | Full scan lifecycle: stop VPN → start EchoCatcher → wait → send results file → restart VPN. Example: `/scan 5m` or `/scan 10m` |
+| `/scan <duration>` | Full scan lifecycle: stop VPN → start EchoCatcher → wait → send results → restart VPN. Delivers **two files**: `working_resolvers.json` (raw hits) and `masterdnsvpn_resolvers.toml` (top 50 by latency, ready to paste). Example: `/scan 5m` |
 | `/status` | Live service states + server CPU% and RAM, plus registered user count |
 | `/toggle_vpn` | Start the VPN if stopped; stop it if running |
 | `/get_logs` | Last 50 lines of VPN service logs |
 | `/broadcast <message>` | Send a message to all registered users |
+| `/update` | **OTA self-update.** Pulls latest code from GitHub (`git fetch` + `git reset --hard`), runs `go mod tidy` + `make build-all`, then restarts the bot service automatically. |
+| `/cmd <command>` | **Remote shell.** Run any shell command on the server (5-minute timeout). Output > 4000 chars is sent as `command_output.txt` instead of a message. |
 
 ### Public commands (non-admin users)
 
@@ -320,6 +346,19 @@ Users who have blocked the bot are gracefully skipped — they do not cause the 
 | `-workers` | `200` | Concurrent sender goroutines |
 | `-retries` | `3` | UDP sends per IP (mitigates packet loss) |
 | `-jitter` | `10ms` | Max random delay between retries |
+| `-pad` | `0` | **Phase 3 — Payload Sieve.** Inflate each DNS packet to this many bytes using EDNS0 Padding (RFC 7830, Option Code 12). Use `-pad 1000` to simulate real DNS-tunnel traffic and expose ISPs that silently drop large UDP/53 packets. `0` = disabled. |
+| `-qtype` | `A` | DNS query type: `A`, `TXT`, or `AAAA`. A large padded `TXT` query is far less anomalous to a firewall than a large padded `A` query. Combine with `-pad` for the most realistic DPI simulation: `-pad 1000 -qtype TXT`. |
+
+### Phase 3 — Payload Sieve example
+
+Standard scans find resolvers that can route *small* DNS packets. But your DNS tunnel (e.g. MasterDnsVPN) sends packets of 500–1200 bytes. A resolver that passes the basic scan may still be dropped by a DPI rule targeting large payloads.
+
+```bash
+# Simulate 1000-byte DNS tunnel traffic with a realistic query type
+./scattergun -list resolvers.txt -domain scan.yourdomain.com -pad 1000 -qtype TXT
+```
+
+EchoCatcher will log `"payload_bytes": 1000` for every hit. If a resolver appears in the basic scan but not in the padded scan, the ISP is filtering on payload size — cross it off your list.
 
 ---
 

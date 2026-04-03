@@ -3,11 +3,24 @@
 // Usage:
 //
 //	./scattergun -list ips.txt -domain scan.example.com -workers 200 -retries 3 -jitter 10ms
+//	./scattergun -list ips.txt -domain scan.example.com -pad 1000 -qtype TXT
 //
-// For each IP in the input file, scattergun crafts a DNS A-query whose QNAME
+// For each IP in the input file, scattergun crafts a DNS query whose QNAME
 // encodes the target IP and a Unix timestamp, then fires it over UDP without
 // waiting for any reply ("fire-and-forget").  The companion echocatcher binary
 // runs on an external authoritative nameserver and logs every query that arrives.
+//
+// Phase 3 — Payload Sieve:
+//
+//	-pad <bytes>   Inflates the UDP packet to the specified size using the EDNS0
+//	               Padding Option (RFC 7830, Option Code 12).  Use this to simulate
+//	               the payload size of a real DNS tunnel (e.g. MasterDnsVPN) and
+//	               reveal ISP DPI rules that drop large UDP/53 packets.
+//	               Recommended: -pad 1000 (or higher, matching your tunnel MTU).
+//
+//	-qtype <type>  Query type: "A" (default), "TXT", or "AAAA".
+//	               A 1000-byte padded TXT query looks far more legitimate to a
+//	               firewall than a 1000-byte padded A query — combine with -pad.
 package main
 
 import (
@@ -35,9 +48,9 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	sentCount  atomic.Int64 // packets successfully written to the socket
-	errCount   atomic.Int64 // UDP dial or write errors
-	skipCount  atomic.Int64 // lines skipped (invalid IP, pack error, etc.)
+	sentCount atomic.Int64 // packets successfully written to the socket
+	errCount  atomic.Int64 // UDP dial or write errors
+	skipCount atomic.Int64 // lines skipped (invalid IP, pack error, etc.)
 )
 
 // ---------------------------------------------------------------------------
@@ -50,6 +63,8 @@ type config struct {
 	workers  int
 	retries  int
 	jitter   time.Duration
+	pad      int    // target wire-size in bytes for EDNS0 padding (0 = disabled)
+	qtype    string // query type: "A", "TXT", or "AAAA"
 }
 
 func parseFlags() config {
@@ -59,6 +74,8 @@ func parseFlags() config {
 	flag.IntVar(&cfg.workers, "workers", 200, "Number of concurrent sender goroutines")
 	flag.IntVar(&cfg.retries, "retries", 3, "Number of UDP sends per IP (to mitigate packet loss)")
 	flag.DurationVar(&cfg.jitter, "jitter", 10*time.Millisecond, "Max random sleep between retries")
+	flag.IntVar(&cfg.pad, "pad", 0, "Inflate DNS packet to this many bytes using EDNS0 Padding (RFC 7830). 0 = disabled. Use -pad 1000 to simulate VPN tunnel traffic.")
+	flag.StringVar(&cfg.qtype, "qtype", "A", `DNS query type: "A" (default), "TXT", or "AAAA". Combine with -pad for realistic DPI simulation.`)
 	flag.Parse()
 
 	ok := true
@@ -78,11 +95,34 @@ func parseFlags() config {
 		fmt.Fprintln(os.Stderr, "ERROR: -retries must be >= 1")
 		ok = false
 	}
+	if cfg.pad < 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: -pad must be >= 0")
+		ok = false
+	}
+	switch strings.ToUpper(cfg.qtype) {
+	case "A", "TXT", "AAAA":
+		cfg.qtype = strings.ToUpper(cfg.qtype)
+	default:
+		fmt.Fprintf(os.Stderr, "ERROR: -qtype %q is not supported; choose A, TXT, or AAAA\n", cfg.qtype)
+		ok = false
+	}
 	if !ok {
 		flag.Usage()
 		os.Exit(1)
 	}
 	return cfg
+}
+
+// qtypeToUint16 maps the string flag value to the miekg/dns constant.
+func qtypeToUint16(qtype string) uint16 {
+	switch qtype {
+	case "TXT":
+		return dns.TypeTXT
+	case "AAAA":
+		return dns.TypeAAAA
+	default:
+		return dns.TypeA
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -119,13 +159,43 @@ func buildQNAME(rawIP, domain string) (string, error) {
 // DNS message builder
 // ---------------------------------------------------------------------------
 
-// buildMsg packs a standard recursive A-query for the given FQDN into wire
-// bytes.  Using miekg/dns ensures correct header flags, question encoding, and
-// ID assignment (randomised by the library).
-func buildMsg(qname string) ([]byte, error) {
+// buildMsg packs a DNS query for the given FQDN into wire bytes.
+//
+//   - qtype controls the query type (TypeA, TypeTXT, TypeAAAA).
+//   - padBytes, if > 0, appends an EDNS0 OPT record with an RFC 7830 Padding
+//     option (Option Code 12) that inflates the packet to the requested size.
+//     This is the Phase 3 "Payload Sieve": a large padded query reveals whether
+//     the ISP drops heavy UDP/53 datagrams — as a real DNS tunnel would send.
+func buildMsg(qname string, qtype uint16, padBytes int) ([]byte, error) {
 	m := new(dns.Msg)
-	m.SetQuestion(qname, dns.TypeA)
+	m.SetQuestion(qname, qtype)
 	m.RecursionDesired = true
+
+	if padBytes > 0 {
+		// Pack once without padding to measure the baseline size.
+		baseline, err := m.Pack()
+		if err != nil {
+			return nil, err
+		}
+		// OPT RR overhead (name=1 + type=2 + class=2 + ttl=4 + rdlen=2) = 11 bytes.
+		// EDNS0_PADDING option header (code=2 + len=2) = 4 bytes.
+		const optRROverhead = 11
+		const padOptHeader = 4
+		needed := padBytes - len(baseline) - optRROverhead - padOptHeader
+		if needed < 0 {
+			needed = 0
+		}
+
+		opt := new(dns.OPT)
+		opt.Hdr.Name = "."
+		opt.Hdr.Rrtype = dns.TypeOPT
+		opt.SetUDPSize(dns.DefaultMsgSize)
+		pad := new(dns.EDNS0_PADDING)
+		pad.Padding = make([]byte, needed)
+		opt.Option = append(opt.Option, pad)
+		m.Extra = append(m.Extra, opt)
+	}
+
 	return m.Pack()
 }
 
@@ -174,6 +244,8 @@ func worker(
 	domain string,
 	retries int,
 	jitter time.Duration,
+	qtype uint16,
+	pad int,
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
@@ -198,9 +270,8 @@ func worker(
 			continue
 		}
 
-		msgBytes, err := buildMsg(qname)
+		msgBytes, err := buildMsg(qname, qtype, pad)
 		if err != nil {
-			// Very unlikely with a well-formed QNAME, but handle it.
 			skipCount.Add(1)
 			log.Printf("WARN pack error for %q (%s): %v", rawIP, qname, err)
 			continue
@@ -235,6 +306,12 @@ func worker(
 func main() {
 	cfg := parseFlags()
 
+	qtype := qtypeToUint16(cfg.qtype)
+
+	if cfg.pad > 0 {
+		log.Printf("INFO payload sieve active: targeting %d-byte packets, qtype=%s", cfg.pad, cfg.qtype)
+	}
+
 	// ---- Open IP list ---------------------------------------------------------
 	f, err := os.Open(cfg.listFile)
 	if err != nil {
@@ -261,7 +338,7 @@ func main() {
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.workers; i++ {
 		wg.Add(1)
-		go worker(ctx, ipChan, cfg.domain, cfg.retries, cfg.jitter, &wg)
+		go worker(ctx, ipChan, cfg.domain, cfg.retries, cfg.jitter, qtype, cfg.pad, &wg)
 	}
 
 	// ---- Progress ticker ------------------------------------------------------
