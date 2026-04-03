@@ -1,0 +1,47 @@
+# orchestrator.service — systemd unit for the Server Orchestrator Telegram Bot
+#
+# Installation:
+#   sudo cp orchestrator.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now orchestrator.service
+#
+# Check logs:
+#   journalctl -u orchestrator.service -f
+
+[Unit]
+Description=Server Orchestrator Telegram Bot
+Documentation=https://github.com/user/scattergun
+# Wait for the network to be fully up before starting.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as a dedicated low-privilege user.
+# Create it with:  sudo useradd -r -s /bin/false bot
+User=bot
+Group=bot
+
+WorkingDirectory=/opt/orchestrator
+
+# Path to the compiled binary.
+ExecStart=/opt/orchestrator/orchestrator-bot
+
+# Tell the bot where its config file lives.
+Environment=CONFIG=/opt/orchestrator/config.yaml
+
+# Restart automatically on crash; wait 5 seconds before each retry.
+Restart=always
+RestartSec=5s
+
+# Increase open file descriptor limit (useful when handling many connections).
+LimitNOFILE=65536
+
+# Write stdout/stderr to the systemd journal (view with journalctl -u orchestrator.service).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orchestrator-bot
+
+[Install]
+WantedBy=multi-user.target

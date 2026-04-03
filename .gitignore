@@ -1,0 +1,23 @@
+# Compiled binaries
+bin/
+
+# Go build cache artifacts
+*.test
+*.out
+
+# Configuration (contains secrets — never commit)
+config.yaml
+
+# Go module download cache (checked in via go.sum, not needed in repo)
+vendor/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
