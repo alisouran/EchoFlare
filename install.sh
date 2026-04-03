@@ -189,21 +189,21 @@ CONFIG_BACKUP="/tmp/dns-orchestrator-config.bak"
 
 if [[ -f "${CONFIG_FILE}" ]]; then
     IS_UPDATE=true
-    info "Existing installation detected — reading saved configuration..."
+    info "Existing installation detected — preserving config, skipping prompts."
 
-    # Extract values from the existing YAML (no external deps — pure grep/sed/awk).
-    BOT_TOKEN=$(grep 'token:' "${CONFIG_FILE}" | sed 's/.*token: *"\(.*\)"/\1/' | head -1)
-    ADMIN_ID=$(grep 'owner_id:' "${CONFIG_FILE}" | awk '{print $2}' | head -1)
-    SCAN_DOMAIN=$(grep 'domain:' "${CONFIG_FILE}" | awk '{print $2}' | head -1)
-
-    [[ -n "${BOT_TOKEN}" ]]   || error "Could not read token from ${CONFIG_FILE}. Fix the file and retry."
-    [[ -n "${ADMIN_ID}" ]]    || error "Could not read owner_id from ${CONFIG_FILE}. Fix the file and retry."
-    [[ -n "${SCAN_DOMAIN}" ]] || error "Could not read scanner.domain from ${CONFIG_FILE}. Add 'domain:' under the 'scanner:' section and retry."
-
-    # Back up the config before anything can overwrite it.
+    # Back up the config. We do NOT parse YAML values with grep/sed — that
+    # is fragile and was the root cause of the premature-exit bug:
+    #   empty variable → [[ -n ]] check fails → error() → exit 1
+    # The Go binary reads the YAML file directly; we never need to extract values.
     cp "${CONFIG_FILE}" "${CONFIG_BACKUP}"
     success "Config backed up to ${CONFIG_BACKUP}"
     success "Updating EchoFlare — existing config will be preserved."
+
+    # Dummy values so the heredoc in Step 6 has no unset variables.
+    # They are never written to disk — the backup is restored in Step 10.
+    BOT_TOKEN="__preserved__"
+    ADMIN_ID="0"
+    SCAN_DOMAIN="preserved"
 
 elif [[ ! -t 0 ]]; then
     warn "Non-interactive shell detected (curl-pipe mode)."
