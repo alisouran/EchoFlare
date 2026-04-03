@@ -115,6 +115,38 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// writeDomainToConfig patches the "domain:" key inside the "scanner:" section
+// of the YAML config file at cfgPath. Creates the key if absent.
+func writeDomainToConfig(cfgPath, domain string) error {
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	inScanner, written := false, false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) > 0 && !strings.HasPrefix(trimmed, "#") &&
+			strings.HasSuffix(trimmed, ":") &&
+			!strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			inScanner = trimmed == "scanner:"
+		}
+		if inScanner && !written && strings.HasPrefix(trimmed, "domain:") {
+			lines[i] = `  domain: "` + domain + `"`
+			written = true
+		}
+	}
+	if !written {
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "scanner:" {
+				lines = append(lines[:i+1], append([]string{`  domain: "` + domain + `"`}, lines[i+1:]...)...)
+				break
+			}
+		}
+	}
+	return os.WriteFile(cfgPath, []byte(strings.Join(lines, "\n")), 0o600)
+}
+
 // ---------------------------------------------------------------------------
 // UserStore — thread-safe, JSON-backed registry of chat IDs
 //
@@ -441,6 +473,7 @@ func serverStats() string {
 // ---------------------------------------------------------------------------
 
 var lossRe = regexp.MustCompile(`(\d+)%\s+packet loss`)
+var domainRe = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
 
 func packetLoss(target string) (int, error) {
 	out, err := exec.Command("ping", "-c", "10", "-W", "1", target).CombinedOutput()
@@ -777,7 +810,8 @@ func main() {
 		"/scan <duration> — run DNS scan (e.g. `/scan 5m`)",
 		"  Stops VPN → starts EchoCatcher → waits → sends results → restarts VPN",
 		"  Delivers: `working_resolvers.json` + `masterdnsvpn_resolvers.toml` (top 50)",
-		"/toggle\\_vpn — start or stop the VPN",
+		"/setdomain <domain> — update scanner domain in config and restart services",
+	"/toggle\\_vpn — start or stop the VPN",
 		"/get\\_logs — last 50 lines of VPN journal logs",
 		"/broadcast <message> — send a message to all registered users",
 		"/update — pull latest code from GitHub and rebuild all binaries",
@@ -846,6 +880,48 @@ func main() {
 			users.Len(),
 		)
 		return c.Send(text, tb.ModeMarkdown)
+	})
+
+	// ---- /setdomain <domain> — admin only -------------------------------------
+	bot.Handle("/setdomain", func(c tb.Context) error {
+		if !adminOnly(c) {
+			return nil
+		}
+		args := c.Args()
+		if len(args) == 0 {
+			return c.Send("Usage: /setdomain <domain>  (e.g. /setdomain r.jibijat.ir)")
+		}
+		newDomain := strings.ToLower(strings.TrimSpace(args[0]))
+		if !domainRe.MatchString(newDomain) {
+			return c.Send(fmt.Sprintf("❌ Invalid domain format: %q\nExample: /setdomain r.jibijat.ir", newDomain))
+		}
+
+		// Update in-memory config immediately — /scan reads cfg.Scanner.Domain.
+		cfg.Scanner.Domain = newDomain
+
+		// Persist to config.yaml.
+		if err := writeDomainToConfig(cfgPath, newDomain); err != nil {
+			reply(c, fmt.Sprintf("⚠️ Domain updated in memory but could not write config.yaml: %v", err))
+		} else {
+			if sendErr := c.Send(fmt.Sprintf("✅ Domain successfully updated to `%s` and saved to config.yaml.\n\nRestarting echocatcher to apply...", newDomain), tb.ModeMarkdown); sendErr != nil {
+				logger.Error("setdomain: reply error", "err", sendErr)
+			}
+		}
+
+		// Restart echocatcher so it picks up the new domain, then restart the bot.
+		// Both happen in a goroutine so the confirmation is delivered first.
+		ownerChat := &tb.Chat{ID: cfg.Telegram.OwnerID}
+		go func() {
+			if err := svcCmd("restart", cfg.Services.Scanner); err != nil {
+				safeSend(ownerChat, fmt.Sprintf("⚠️ echocatcher restart failed: %v", err))
+			} else {
+				safeSend(ownerChat, "✅ echocatcher restarted.")
+			}
+			if err := exec.Command("sudo", "systemctl", "restart", "orchestrator-bot").Start(); err != nil {
+				safeSend(ownerChat, fmt.Sprintf("⚠️ orchestrator-bot restart failed: %v\nRun manually: sudo systemctl restart orchestrator-bot", err))
+			}
+		}()
+		return nil
 	})
 
 	// ---- /scan <duration> — admin only ----------------------------------------
@@ -984,6 +1060,14 @@ func main() {
 
 			// Brief pause so the OS fully releases port 53 before echocatcher binds.
 			time.Sleep(2 * time.Second)
+
+			// ── Reset log file so counters start at 0 for this scan ───────────────────────
+			// Truncate (not delete) to preserve file ownership/permissions.
+			if f, truncErr := os.OpenFile(logFile, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0o640); truncErr != nil {
+				logger.Warn("scan: could not truncate log file — counter may show stale data", "err", truncErr)
+			} else {
+				f.Close()
+			}
 
 			// ── Step 1: Start EchoCatcher ──────────────────────────────────────
 			if err := svcCmd("start", cfg.Services.Scanner); err != nil {
@@ -1288,43 +1372,12 @@ func main() {
 					return
 				}
 
-				// Patch the in-memory config and write the domain into config.yaml.
-				// We rewrite the file line-by-line, replacing only the "domain:" key
-				// that sits directly inside the "scanner:" section (tracked by a flag),
-				// so services.scanner and any other keys are never touched.
+				// Patch the in-memory config and persist to config.yaml.
 				cfg.Scanner.Domain = newDomain
-				if rawCfg, readErr := os.ReadFile(cfgPath); readErr != nil {
-					safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not read config.yaml: %v", readErr))
+				if writeErr := writeDomainToConfig(cfgPath, newDomain); writeErr != nil {
+					safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not write config.yaml: %v", writeErr))
 				} else {
-					lines := strings.Split(string(rawCfg), "\n")
-					inScannerSection := false
-					domainWritten := false
-					for i, line := range lines {
-						trimmed := strings.TrimSpace(line)
-						// Detect section headers (non-indented keys ending with colon).
-						if len(trimmed) > 0 && !strings.HasPrefix(trimmed, "#") && strings.HasSuffix(trimmed, ":") && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
-							inScannerSection = trimmed == "scanner:"
-						}
-						// Replace the domain key only when we are inside the scanner section.
-						if inScannerSection && !domainWritten && strings.HasPrefix(trimmed, "domain:") {
-							lines[i] = `  domain: "` + newDomain + `"`
-							domainWritten = true
-						}
-					}
-					if !domainWritten {
-						// domain key missing entirely — append it after the scanner: header.
-						for i, line := range lines {
-							if strings.TrimSpace(line) == "scanner:" {
-								lines = append(lines[:i+1], append([]string{`  domain: "` + newDomain + `"`}, lines[i+1:]...)...)
-								break
-							}
-						}
-					}
-					if writeErr := os.WriteFile(cfgPath, []byte(strings.Join(lines, "\n")), 0o600); writeErr != nil {
-						safeSend(destChat, fmt.Sprintf("⚠️ Domain set in memory but could not write config.yaml: %v", writeErr))
-					} else {
-						safeSend(destChat, fmt.Sprintf("✅ Domain `%s` saved to config.yaml.", newDomain), tb.ModeMarkdown)
-					}
+					safeSend(destChat, fmt.Sprintf("✅ Domain `%s` saved to config.yaml.", newDomain), tb.ModeMarkdown)
 				}
 			}
 
