@@ -412,10 +412,10 @@ step "Starting ${SERVICE_NAME}"
 systemctl daemon-reload
 
 if [[ "${IS_UPDATE}" == "true" ]]; then
-    # Restore the preserved config (step 6 would have overwritten it).
-    cp "${CONFIG_BACKUP}" "${CONFIG_FILE}"
-    chmod 600 "${CONFIG_FILE}"
-    success "Config restored from backup."
+    # The config was never touched during an update (step 6 was skipped entirely),
+    # so there is nothing to restore — the live file is already correct.
+    # We keep the backup at ${CONFIG_BACKUP} for manual disaster recovery only.
+    success "Config unchanged (update path skipped all writes)."
     systemctl restart "${SERVICE_NAME}"
 else
     systemctl enable --now "${SERVICE_NAME}"
