@@ -50,10 +50,12 @@ jobs:
             buildflags: ""
 
           - name: termux-arm64
-            goos: linux
+            goos: android
             goarch: arm64
             binary: scattergun
-            buildflags: "-buildmode=pie"
+            buildflags: ""
+            cgo: "1"
+            android_api: "29"
 
     steps:
       - name: Checkout
@@ -64,13 +66,25 @@ jobs:
         with:
           go-version: "1.22"
 
+      - name: Setup Android NDK (Termux only)
+        if: matrix.name == 'termux-arm64'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
       - name: Build scattergun
         env:
-          CGO_ENABLED: "0"
+          CGO_ENABLED: ${{ matrix.cgo || '0' }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
+          if [ "${{ matrix.name }}" = "termux-arm64" ]; then
+            TOOLCHAIN_BIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            export CC="${TOOLCHAIN_BIN}/aarch64-linux-android${{ matrix.android_api }}-clang"
+          fi
           go build -trimpath -ldflags="-s -w" ${{ matrix.buildflags }} -o "dist/${{ matrix.binary }}" ./scattergun/
 
       - name: Create sample resolvers.txt
