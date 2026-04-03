@@ -177,19 +177,39 @@ fi
 success "Source at: ${SRC_DIR}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Interactive configuration
+# 5. Configuration — detect update vs fresh install
 # ─────────────────────────────────────────────────────────────────────────────
 step "Configuration"
 
-# Skip prompts if stdin is not a terminal (e.g. curl | bash with no tty).
-# In that case the user must edit the config file manually after install.
-if [[ ! -t 0 ]]; then
+IS_UPDATE=false
+CONFIG_BACKUP="/tmp/dns-orchestrator-config.bak"
+
+if [[ -f "${CONFIG_FILE}" ]]; then
+    IS_UPDATE=true
+    info "Existing installation detected — reading saved configuration..."
+
+    # Extract values from the existing YAML (no external deps — pure grep/sed/awk).
+    BOT_TOKEN=$(grep 'token:' "${CONFIG_FILE}" | sed 's/.*token: *"\(.*\)"/\1/' | head -1)
+    ADMIN_ID=$(grep 'owner_id:' "${CONFIG_FILE}" | awk '{print $2}' | head -1)
+    SCAN_DOMAIN=$(grep 'domain:' "${CONFIG_FILE}" | awk '{print $2}' | head -1)
+
+    [[ -n "${BOT_TOKEN}" ]]   || error "Could not read token from ${CONFIG_FILE}. Fix the file and retry."
+    [[ -n "${ADMIN_ID}" ]]    || error "Could not read owner_id from ${CONFIG_FILE}. Fix the file and retry."
+    [[ -n "${SCAN_DOMAIN}" ]] || error "Could not read scanner.domain from ${CONFIG_FILE}. Add 'domain:' under the 'scanner:' section and retry."
+
+    # Back up the config before anything can overwrite it.
+    cp "${CONFIG_FILE}" "${CONFIG_BACKUP}"
+    success "Config backed up to ${CONFIG_BACKUP}"
+    success "Updating EchoFlare — existing config will be preserved."
+
+elif [[ ! -t 0 ]]; then
     warn "Non-interactive shell detected (curl-pipe mode)."
     warn "A placeholder config will be written to ${CONFIG_FILE}."
     warn "Edit it and run: systemctl restart ${SERVICE_NAME}"
     BOT_TOKEN="REPLACE_WITH_YOUR_BOT_TOKEN"
     ADMIN_ID="0"
     SCAN_DOMAIN="scan.yourdomain.com"
+
 else
     echo ""
     echo -e "  ${BOLD}You will need:${NC}"
@@ -243,6 +263,8 @@ services:
   scanner: "echocatcher.service"
 
 scanner:
+  # The authoritative zone EchoCatcher listens on.
+  domain: "${SCAN_DOMAIN}"
   # EchoCatcher writes its results here; this file is sent to you after /scan.
   log_file: "${LOG_DIR}/working_dns.json"
 
@@ -280,11 +302,9 @@ success "  ${BOT_BIN}  ($(du -sh "${BOT_BIN}" | cut -f1))"
 success "  ${CATCHER_BIN}  ($(du -sh "${CATCHER_BIN}" | cut -f1))"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Create systemd service for the bot
-#    echocatcher is intentionally NOT registered here — it is started and
-#    stopped ad-hoc by the bot itself via systemctl.
+# 8. Create systemd service for the orchestrator bot
 # ─────────────────────────────────────────────────────────────────────────────
-step "Creating systemd service"
+step "Creating systemd services"
 
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -320,6 +340,29 @@ WantedBy=multi-user.target
 EOF
 
 success "Service file written to /etc/systemd/system/${SERVICE_NAME}.service"
+
+# Create echocatcher.service — registered but NOT enabled.
+# The bot starts/stops it on demand via systemctl; it must never auto-start on boot.
+cat > "/etc/systemd/system/echocatcher.service" <<EOF
+[Unit]
+Description=EchoCatcher DNS Receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${CATCHER_BIN} -domain ${SCAN_DOMAIN} -log ${LOG_DIR}/working_dns.json -bind 0.0.0.0:53
+Restart=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=echocatcher
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+success "echocatcher.service written (not enabled — bot controls lifecycle)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. Sudoers — passwordless systemctl for the required services
@@ -361,7 +404,16 @@ success "Sudoers rule installed at ${SUDOERS_FILE} (validated OK)."
 step "Starting ${SERVICE_NAME}"
 
 systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}"
+
+if [[ "${IS_UPDATE}" == "true" ]]; then
+    # Restore the preserved config (step 6 would have overwritten it).
+    cp "${CONFIG_BACKUP}" "${CONFIG_FILE}"
+    chmod 600 "${CONFIG_FILE}"
+    success "Config restored from backup."
+    systemctl restart "${SERVICE_NAME}"
+else
+    systemctl enable --now "${SERVICE_NAME}"
+fi
 
 # Give the process a moment to settle before checking.
 sleep 2
@@ -394,7 +446,9 @@ echo -e "  ${BOLD}Catcher:${NC}       ${CYAN}${CATCHER_BIN}${NC}"
 echo -e "  ${BOLD}Scan logs:${NC}     ${CYAN}${LOG_DIR}/${NC}"
 echo ""
 
-if [[ "${BOT_TOKEN}" == "REPLACE_WITH_YOUR_BOT_TOKEN" ]]; then
+if [[ "${IS_UPDATE}" == "true" ]]; then
+    echo -e "  ${GREEN}♻️  Update complete! Bot restarted with your existing config. ✈️${NC}"
+elif [[ "${BOT_TOKEN}" == "REPLACE_WITH_YOUR_BOT_TOKEN" ]]; then
     echo -e "  ${YELLOW}${BOLD}⚠️  Non-interactive install detected.${NC}"
     echo -e "  ${YELLOW}Edit the config and restart the service:${NC}"
     echo -e "    ${CYAN}nano ${CONFIG_FILE}${NC}"

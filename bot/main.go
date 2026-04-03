@@ -645,14 +645,24 @@ func main() {
 
 			// Step 1: Stop VPN.
 			if err := svcCmd("stop", cfg.Services.VPN); err != nil {
-				send(fmt.Sprintf("❌ Failed to stop VPN: %v\nScan aborted.", err))
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "Unit") {
+					send(fmt.Sprintf("❌ Service %q not found.\nVerify the service name in config.yaml and re-run install.sh.\nScan aborted.", cfg.Services.VPN))
+				} else {
+					send(fmt.Sprintf("❌ Failed to stop VPN:\n%s\nScan aborted.", errMsg))
+				}
 				return
 			}
 			send("✅ VPN stopped.")
 
 			// Step 2: Start EchoCatcher.
 			if err := svcCmd("start", cfg.Services.Scanner); err != nil {
-				send(fmt.Sprintf("❌ Failed to start EchoCatcher: %v\nRestarting VPN...", err))
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "Unit") {
+					send("❌ echocatcher.service not found on this server.\nRe-run install.sh to register the service, then try again.\nRestarting VPN...")
+				} else {
+					send(fmt.Sprintf("❌ Failed to start EchoCatcher:\n%s\nRestarting VPN...", errMsg))
+				}
 				svcCmd("restart", cfg.Services.VPN) //nolint:errcheck
 				send("✅ VPN restarted.")
 				return

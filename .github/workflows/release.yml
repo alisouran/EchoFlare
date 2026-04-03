@@ -9,8 +9,12 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.name }}
+  # ────────────────────────────────────────────────────────────────────────────
+  # CLIENT builds — scattergun only + sample resolvers.txt
+  # Target audience: end-users running on their restricted local network
+  # ────────────────────────────────────────────────────────────────────────────
+  build-client:
+    name: Client — ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -18,38 +22,32 @@ jobs:
           - name: linux-amd64
             goos: linux
             goarch: amd64
-            archive: tar.gz
-            include_echocatcher: true
+            binary: scattergun
 
           - name: linux-arm64
             goos: linux
             goarch: arm64
-            archive: tar.gz
-            include_echocatcher: true
+            binary: scattergun
 
           - name: darwin-amd64
             goos: darwin
             goarch: amd64
-            archive: tar.gz
-            include_echocatcher: true
+            binary: scattergun
 
           - name: darwin-arm64
             goos: darwin
             goarch: arm64
-            archive: tar.gz
-            include_echocatcher: true
+            binary: scattergun
 
           - name: windows-amd64
             goos: windows
             goarch: amd64
-            archive: zip
-            include_echocatcher: false
+            binary: scattergun.exe
 
           - name: android-arm64
             goos: linux
             goarch: arm64
-            archive: tar.gz
-            include_echocatcher: false
+            binary: scattergun
 
     steps:
       - name: Checkout
@@ -67,43 +65,98 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          BINARY=scattergun
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            BINARY=scattergun.exe
-          fi
-          go build -trimpath -ldflags="-s -w" -o "dist/$BINARY" ./scattergun/
+          go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.binary }}" ./scattergun/
+
+      - name: Create sample resolvers.txt
+        run: |
+          cat > dist/resolvers.txt <<'EOF'
+          # resolvers.txt — List of DNS resolver IPs to test, one per line.
+          # Place this file in the same folder as the scattergun binary.
+          # Run: ./scattergun -list resolvers.txt -domain scan.yourdomain.com
+          #
+          # Sample public resolvers (replace with your target list):
+          8.8.8.8
+          8.8.4.4
+          1.1.1.1
+          1.0.0.1
+          9.9.9.9
+          208.67.222.222
+          208.67.220.220
+          EOF
+
+      - name: Package
+        run: |
+          cd dist && zip "../EchoFlare-Client-${{ matrix.name }}.zip" ./* && cd ..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EchoFlare-Client-${{ matrix.name }}
+          path: EchoFlare-Client-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SERVER builds — echocatcher + orchestrator-bot
+  # Target audience: VPS operators (Linux only)
+  # ────────────────────────────────────────────────────────────────────────────
+  build-server:
+    name: Server — ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+
+          - name: linux-arm64
+            goos: linux
+            goarch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
 
       - name: Build echocatcher
-        if: ${{ matrix.include_echocatcher }}
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          go build -trimpath -ldflags="-s -w" -o "dist/echocatcher" ./echocatcher/
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o dist/echocatcher ./echocatcher/
 
-      - name: Package (tar.gz)
-        if: ${{ matrix.archive == 'tar.gz' }}
+      - name: Build orchestrator-bot
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          tar -czf "scattergun-${{ matrix.name }}.tar.gz" -C dist .
+          go build -trimpath -ldflags="-s -w" -o dist/orchestrator-bot ./bot/
 
-      - name: Package (zip)
-        if: ${{ matrix.archive == 'zip' }}
+      - name: Package
         run: |
-          cd dist && zip "../scattergun-${{ matrix.name }}.zip" ./* && cd ..
+          cd dist && zip "../EchoFlare-Server-${{ matrix.name }}.zip" ./* && cd ..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          # Artifact name must not contain dots — use matrix.name as the key
-          name: scattergun-${{ matrix.name }}
-          path: scattergun-${{ matrix.name }}.*
+          name: EchoFlare-Server-${{ matrix.name }}
+          path: EchoFlare-Server-${{ matrix.name }}.zip
           if-no-files-found: error
 
+  # ────────────────────────────────────────────────────────────────────────────
+  # Release — collect all artifacts and publish
+  # ────────────────────────────────────────────────────────────────────────────
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build-client, build-server]
 
     steps:
       - name: Download all artifacts
@@ -120,5 +173,25 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+          body: |
+            ## Downloads
+
+            ### 📦 Client (Scattergun) — run on your restricted local network
+            | Platform | File |
+            |---|---|
+            | Linux x86-64 | `EchoFlare-Client-linux-amd64.zip` |
+            | Linux ARM64 | `EchoFlare-Client-linux-arm64.zip` |
+            | macOS Intel | `EchoFlare-Client-darwin-amd64.zip` |
+            | macOS Apple Silicon | `EchoFlare-Client-darwin-arm64.zip` |
+            | Windows x86-64 | `EchoFlare-Client-windows-amd64.zip` |
+            | Android (Termux) | `EchoFlare-Client-android-arm64.zip` |
+
+            ### 🖥️ Server (EchoCatcher + Bot) — deploy on your VPS
+            | Platform | File |
+            |---|---|
+            | Linux x86-64 | `EchoFlare-Server-linux-amd64.zip` |
+            | Linux ARM64 | `EchoFlare-Server-linux-arm64.zip` |
+
+            > **Note:** Most users only need the **Client** zip. The server is set up automatically via `install.sh`.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
