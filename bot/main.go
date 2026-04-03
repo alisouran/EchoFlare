@@ -226,55 +226,112 @@ func svcCmd(action, service string) error {
 	return nil
 }
 
-// freePort53 performs an aggressive port-53 liberation sequence:
-//  1. Stops and disables systemd-resolved so it can never reclaim the port.
-//  2. Overwrites /etc/resolv.conf with a static public nameserver so the
-//     VPS retains outbound DNS (required for the Telegram API connection).
-//  3. Force-kills any remaining process holding UDP/53 or TCP/53 via fuser.
+// bulldozerCleanup performs the full "clean slate" pre-flight routine:
 //
-// Each sub-step is logged but never fatal: a partial failure is better than
-// aborting the whole scan — echocatcher will either bind or fail with a clear
-// error message.
-func freePort53(logger *slog.Logger) {
-	// Step 1: stop + disable systemd-resolved.
+//  1. Stops MasterDnsVPN service (belt-and-suspenders — caller already stops it,
+//     but we repeat here in case anything restarted it).
+//  2. SIGKILL all dnstt process trees (zombie DNS-tunnel clients that squirt
+//     queries for the VPN domain and pollute the capture with false positives).
+//  3. Stops + disables systemd-resolved so it can never reclaim port 53.
+//  4. Overwrites /etc/resolv.conf with static public DNS so the VPS retains
+//     outbound DNS for the Telegram API throughout the scan.
+//  5. Force-kills any remaining process on UDP/53 and TCP/53 via fuser.
+//
+// Every sub-step is logged but never fatal — a partial failure is better than
+// aborting the whole scan. echocatcher will either bind or emit a clear error.
+func bulldozerCleanup(vpnService string, logger *slog.Logger) {
+	// 1. Re-stop the VPN service (idempotent; already stopped by the caller).
+	out, err := exec.Command("sudo", "systemctl", "stop", vpnService).CombinedOutput()
+	if err != nil {
+		logger.Info("bulldozer: systemctl stop vpn (may be harmless)",
+			"service", vpnService, "out", strings.TrimSpace(string(out)))
+	} else {
+		logger.Info("bulldozer: vpn service stopped", "service", vpnService)
+	}
+
+	// 2. Kill all dnstt processes by full command-line match (SIGKILL, no mercy).
+	out, err = exec.Command("pkill", "-9", "-f", "dnstt").CombinedOutput()
+	if err != nil {
+		// pkill exits 1 when no matching process was found — not an error.
+		logger.Info("bulldozer: pkill dnstt (no match or killed)",
+			"out", strings.TrimSpace(string(out)))
+	} else {
+		logger.Info("bulldozer: killed dnstt processes")
+	}
+
+	// 3. Stop + disable systemd-resolved.
 	for _, args := range [][]string{
 		{"systemctl", "stop", "systemd-resolved"},
 		{"systemctl", "disable", "systemd-resolved"},
 	} {
 		out, err := exec.Command("sudo", args...).CombinedOutput()
 		if err != nil {
-			// "not found" / "not loaded" are harmless — resolved may not be present.
-			logger.Info("freePort53: systemctl op (may be harmless)",
+			logger.Info("bulldozer: systemctl op (may be harmless)",
 				"args", strings.Join(args, " "),
-				"out", strings.TrimSpace(string(out)),
-			)
+				"out", strings.TrimSpace(string(out)))
 		} else {
-			logger.Info("freePort53: ok", "args", strings.Join(args, " "))
+			logger.Info("bulldozer: ok", "args", strings.Join(args, " "))
 		}
 	}
 
-	// Step 2: write a static resolv.conf so the VPS can still reach Telegram.
+	// 4. Write static resolv.conf so the VPS keeps outbound DNS for Telegram.
 	const staticResolv = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n"
 	if err := os.WriteFile("/etc/resolv.conf", []byte(staticResolv), 0o644); err != nil {
-		logger.Warn("freePort53: could not write /etc/resolv.conf", "err", err)
+		logger.Warn("bulldozer: could not write /etc/resolv.conf", "err", err)
 	} else {
-		logger.Info("freePort53: /etc/resolv.conf set to 8.8.8.8")
+		logger.Info("bulldozer: /etc/resolv.conf set to 8.8.8.8/8.8.4.4")
 	}
 
-	// Step 3: force-kill any process still holding port 53.
+	// 5. Force-kill any process still holding port 53 on either protocol.
 	for _, proto := range []string{"udp", "tcp"} {
 		portProto := "53/" + proto
 		out, err := exec.Command("sudo", "fuser", "-k", portProto).CombinedOutput()
 		if err != nil {
-			// fuser exits 1 when no process owns the port — not an error.
-			logger.Info("freePort53: fuser (no owner or killed)",
-				"port", portProto,
-				"out", strings.TrimSpace(string(out)),
-			)
+			logger.Info("bulldozer: fuser (no owner or killed)",
+				"port", portProto, "out", strings.TrimSpace(string(out)))
 		} else {
-			logger.Info("freePort53: killed port owner", "port", portProto)
+			logger.Info("bulldozer: killed port owner", "port", portProto)
 		}
 	}
+}
+
+// checkDNSPropagation sends a probe query for a synthetic subdomain under the
+// scan domain to 8.8.8.8 and checks whether Google's resolver is delegating
+// to our authoritative NS correctly.
+//
+// We query "probe-test.<domain>" via the system dig(1) binary with a strict
+// 5-second timeout. Two outcomes count as "propagated":
+//   - NXDOMAIN  — our NS replied "no such name", which proves delegation works
+//     (the resolver reached echocatcher's NS, got a valid authoritative answer).
+//   - NOERROR   — an actual answer arrived (e.g. the A record exists).
+//
+// Anything else (SERVFAIL, timeout, connection refused) means the NS records
+// have not yet reached 8.8.8.8 and the scan should be aborted.
+//
+// Returns (propagated bool, digOutput string, err error).
+func checkDNSPropagation(domain string) (bool, string, error) {
+	probe := "probe-test." + domain
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "dig", "@8.8.8.8", probe, "+time=5", "+tries=1").CombinedOutput()
+	output := strings.TrimSpace(string(out))
+
+	if ctx.Err() != nil {
+		return false, output, fmt.Errorf("dig timed out after 10s")
+	}
+	if err != nil {
+		// dig exits non-zero on network errors but still writes useful output.
+		// Fall through to content check below.
+		_ = err
+	}
+
+	// A response containing NXDOMAIN or NOERROR in the status line means
+	// our NS is being reached by 8.8.8.8 — delegation is live.
+	if strings.Contains(output, "NXDOMAIN") || strings.Contains(output, "status: NOERROR") {
+		return true, output, nil
+	}
+	return false, output, nil
 }
 
 func svcStatus(service string) string {
@@ -896,26 +953,39 @@ func main() {
 				scanMu.Unlock()
 			}()
 
-			// Step 1: Stop VPN.
-			if err := svcCmd("stop", cfg.Services.VPN); err != nil {
-				errMsg := err.Error()
-				if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "Unit") {
-					send(fmt.Sprintf("❌ Service %q not found.\nVerify the service name in config.yaml and re-run install.sh.\nScan aborted.", cfg.Services.VPN))
-				} else {
-					send(fmt.Sprintf("❌ Failed to stop VPN:\n%s\nScan aborted.", errMsg))
-				}
+			// ── Pre-flight step A: DNS propagation check ───────────────────────
+			// Verify that 8.8.8.8 is already delegating to our authoritative NS
+			// before we burn scan time. Abort immediately if not propagated.
+			editProgress(dur, "🔍 Checking DNS propagation...")
+			propagated, digOut, digErr := checkDNSPropagation(domain)
+			if digErr != nil {
+				send(fmt.Sprintf(
+					"⚠️ *Scan Aborted: DNS propagation check failed.*\n\n`dig` error: `%v`\n\nCloudflare NS records for `%s` may not be propagated to global DNS (8.8.8.8) yet. Please wait a few minutes and try again.",
+					digErr, domain,
+				))
 				return
 			}
+			if !propagated {
+				send(fmt.Sprintf(
+					"⚠️ *Scan Aborted: Cloudflare NS records for `%s` are not yet propagated to global DNS (8.8.8.8).*\n\nPlease wait a few minutes and try again.\n\n_dig output:_\n```\n%s\n```",
+					domain, digOut,
+				))
+				return
+			}
+			send(fmt.Sprintf(
+				"✅ *Pre-flight passed!* Network is clean and DNS for `%s` is propagated to 8.8.8.8. Starting the scan...",
+				domain,
+			))
 
-			// Step 2: Port-53 liberation — stop systemd-resolved, fix resolv.conf,
-			// force-kill any remaining port-53 squatters.
-			editProgress(dur, "Freeing port 53...")
-			freePort53(logger)
+			// ── Pre-flight step B: Bulldozer cleanup ───────────────────────────
+			// Stop VPN service, kill dnstt zombies, free port 53, fix resolv.conf.
+			editProgress(dur, "🔧 Bulldozer cleanup — silencing conflicting processes...")
+			bulldozerCleanup(cfg.Services.VPN, logger)
 
-			// Step 3: Brief pause so the OS fully releases port 53.
+			// Brief pause so the OS fully releases port 53 before echocatcher binds.
 			time.Sleep(2 * time.Second)
 
-			// Step 4: Start EchoCatcher.
+			// ── Step 1: Start EchoCatcher ──────────────────────────────────────
 			if err := svcCmd("start", cfg.Services.Scanner); err != nil {
 				errMsg := err.Error()
 				if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "Unit") {
@@ -928,7 +998,7 @@ func main() {
 				return
 			}
 
-			// Step 5: Wait with live progress ticker (edit every 5 s, respect Telegram rate limits).
+			// ── Step 2: Countdown ticker ───────────────────────────────────────
 			deadline := time.Now().Add(dur)
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
@@ -949,7 +1019,7 @@ func main() {
 				}
 			}
 
-			// Step 6: Stop EchoCatcher.
+			// ── Step 3: Stop EchoCatcher ───────────────────────────────────────
 			editProgress(0, "Stopping scanner...")
 			if err := svcCmd("stop", cfg.Services.Scanner); err != nil {
 				logger.Warn("stop scanner error", "err", err)
@@ -1024,7 +1094,7 @@ func main() {
 				}
 			}
 
-			// Step 7: Restart VPN — restores the service's own DNS handling.
+			// ── Step 4: Restart VPN — restores the service's own DNS handling ──
 			if err := svcCmd("restart", cfg.Services.VPN); err != nil {
 				send(fmt.Sprintf("⚠️ Failed to restart VPN: %v\nPlease restart it manually!", err))
 				return

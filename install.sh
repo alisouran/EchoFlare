@@ -111,6 +111,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     sudo \
     psmisc \
+    dnsutils \
+    procps \
     2>/dev/null
 
 success "System packages ready."
@@ -423,7 +425,7 @@ root ALL=(ALL) NOPASSWD: /bin/systemctl start masterdnsvpn.service
 root ALL=(ALL) NOPASSWD: /bin/systemctl stop masterdnsvpn.service
 root ALL=(ALL) NOPASSWD: /bin/systemctl restart masterdnsvpn.service
 
-# Port-53 liberation — freePort53() routine executed before each /scan
+# Bulldozer cleanup — runs before each /scan to silence conflicting processes
 root ALL=(ALL) NOPASSWD: /bin/systemctl stop systemd-resolved
 root ALL=(ALL) NOPASSWD: /bin/systemctl disable systemd-resolved
 root ALL=(ALL) NOPASSWD: /usr/bin/fuser -k 53/udp
