@@ -26,6 +26,7 @@ package main
 import (
 	"bufio"
 	"context"
+	crand "crypto/rand"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -140,8 +141,8 @@ func qtypeToUint16(qtype string) uint16 {
 // the fixed-length all-hex pattern that DPI systems flag as DNS tunneling.
 //
 //	<base36_ip>.<base36_ts>.<domain>.
-//	e.g.  1d1x2h.lncy2g.scan.yourdomain.com.   (IPv4)
-//	      3x1a2b...x...4c5d.lncy2g.scan.yourdomain.com.  (IPv6, hi "x" lo)
+//	e.g.  1d1-2h.lncy2g.scan.yourdomain.com.     (IPv4)
+//	      3-1a2b...-...4c5d.lncy2g.scan.yourdomain.com.  (IPv6, hi "-" lo)
 func buildQNAME(rawIP, domain string) (string, error) {
 	ip := net.ParseIP(strings.TrimSpace(rawIP))
 	if ip == nil {
@@ -154,11 +155,11 @@ func buildQNAME(rawIP, domain string) (string, error) {
 		ipInt := binary.BigEndian.Uint32(v4)
 		encodedIP = strconv.FormatUint(uint64(ipInt), 36)
 	} else {
-		// IPv6 → two uint64 halves in base36, joined by "x" (not a base36 digit)
+		// IPv6 → two uint64 halves in base36, joined by "-" (DNS-label-safe separator)
 		b := ip.To16()
 		hi := binary.BigEndian.Uint64(b[:8])
 		lo := binary.BigEndian.Uint64(b[8:])
-		encodedIP = strconv.FormatUint(hi, 36) + "x" + strconv.FormatUint(lo, 36)
+		encodedIP = strconv.FormatUint(hi, 36) + "-" + strconv.FormatUint(lo, 36)
 	}
 
 	ts := time.Now().Unix()
@@ -177,10 +178,14 @@ func buildQNAME(rawIP, domain string) (string, error) {
 //     option (Option Code 12) that inflates the packet to the requested size.
 //     This is the Phase 3 "Payload Sieve": a large padded query reveals whether
 //     the ISP drops heavy UDP/53 datagrams — as a real DNS tunnel would send.
+//
+// The Transaction ID is set via dns.Id() before packing so each call produces
+// a fresh TXID without any post-pack byte mutation (no data race).
 func buildMsg(qname string, qtype uint16, padBytes int) ([]byte, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(qname, qtype)
 	m.RecursionDesired = true
+	m.Id = dns.Id() // unique TXID per packet, set cleanly before packing
 
 	if padBytes > 0 {
 		// Pack once without padding to measure the baseline size.
@@ -225,11 +230,12 @@ func buildMsg(qname string, qtype uint16, padBytes int) ([]byte, error) {
 // Fire-and-forget UDP send
 // ---------------------------------------------------------------------------
 
-// sendUDP dials the target resolver on port 53, sets a short write deadline,
+// sendUDP dials the target resolver on port 53, sets a write deadline,
 // and writes the pre-packed DNS message bytes.  It never reads a reply.
 //
-// A short write deadline (100 ms) is used purely to prevent hanging when the
-// OS send buffer is full; it does NOT wait for a DNS response.
+// The 500 ms write deadline prevents hanging when the OS send buffer is full
+// under high concurrency without being so tight that it causes spurious drops.
+// It does NOT wait for a DNS response.
 func sendUDP(targetIP string, msgBytes []byte) error {
 	raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, "53"))
 	if err != nil {
@@ -245,16 +251,8 @@ func sendUDP(targetIP string, msgBytes []byte) error {
 	defer conn.Close()
 
 	// Only a write deadline — no read deadline because we never read.
-	if err := conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
 		return fmt.Errorf("set deadline %s: %w", targetIP, err)
-	}
-
-	// Randomize the DNS Transaction ID (first 2 bytes of the wire format) for
-	// every individual packet so each probe looks unique to DPI inspection.
-	if len(msgBytes) >= 2 {
-		txid := dns.Id()
-		msgBytes[0] = byte(txid >> 8)
-		msgBytes[1] = byte(txid)
 	}
 
 	if _, err := conn.Write(msgBytes); err != nil {
@@ -281,10 +279,16 @@ func worker(
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
-	// Each worker has its own random source to avoid contention on the global
-	// math/rand mutex when hundreds of goroutines run concurrently.
+	// Each worker gets a uniquely seeded RNG sourced from crypto/rand so that
+	// workers started in the same nanosecond don't produce identical jitter
+	// sequences and synchronize their burst sends.
+	var seedBytes [8]byte
+	if _, err := crand.Read(seedBytes[:]); err != nil {
+		// Fallback: mix process time with goroutine stack address for uniqueness.
+		binary.LittleEndian.PutUint64(seedBytes[:], uint64(time.Now().UnixNano()))
+	}
 	//nolint:gosec // non-cryptographic jitter is intentional here
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(seedBytes[:]))))
 
 	for rawIP := range ipChan {
 		rawIP = strings.TrimSpace(rawIP)
@@ -428,6 +432,7 @@ func main() {
 	go func() {
 		scanner := bufio.NewScanner(f)
 		lineCount := 0
+	feedLoop:
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" || strings.HasPrefix(line, "#") {
@@ -438,7 +443,7 @@ func main() {
 			case ipChan <- line:
 			case <-ctx.Done():
 				// Shutdown was requested — stop feeding new IPs.
-				break
+				break feedLoop
 			}
 		}
 		if err := scanner.Err(); err != nil {

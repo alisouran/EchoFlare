@@ -106,10 +106,13 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 	suffix := "." + dns.Fqdn(domain)
 
 	return func(w dns.ResponseWriter, r *dns.Msg) {
-		// Phase 3: capture the total wire size of the incoming DNS message.
-		// r.Len() returns the packed byte count of the message as received,
-		// including any EDNS0 OPT records (and padding) added by scattergun.
-		payloadBytes := r.Len()
+		// Estimate the wire size by re-packing the message.  We use Pack()
+		// rather than Len() because Len() can panic on truncated/malformed
+		// messages; if Pack() fails we fall back to 0 rather than crashing.
+		var payloadBytes int
+		if packed, err := r.Pack(); err == nil {
+			payloadBytes = len(packed)
+		}
 
 		// Identify the resolver that forwarded the query to us.
 		forwarderAddr := w.RemoteAddr().String()
@@ -214,13 +217,13 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 }
 
 // decodeBase36IP converts a base36-encoded IP string back to dotted/colon notation.
-// IPv4 is a single base36 uint32 label (e.g. "1d1x2h").
-// IPv6 is two base36 uint64 halves joined by "x" (e.g. "3abc...x...4def...").
+// IPv4 is a single base36 uint32 label (e.g. "1d1b2h").
+// IPv6 is two base36 uint64 halves joined by "-" (e.g. "3abc...-...4def...").
 // Returns "<decode-error>" on failure and logs a warning.
 func decodeBase36IP(encoded string, logger *slog.Logger) string {
-	if strings.Contains(encoded, "x") {
-		// IPv6 — two base36 uint64 halves separated by "x"
-		halves := strings.SplitN(encoded, "x", 2)
+	if strings.Contains(encoded, "-") {
+		// IPv6 — two base36 uint64 halves separated by "-"
+		halves := strings.SplitN(encoded, "-", 2)
 		hi, err1 := strconv.ParseUint(halves[0], 36, 64)
 		lo, err2 := strconv.ParseUint(halves[1], 36, 64)
 		if err1 != nil || err2 != nil {
@@ -283,24 +286,37 @@ func main() {
 	// structured dns_hit logging; unmatched queries log as dns_raw_packet.
 	dns.HandleFunc(".", makeHandler(cfg.domain, logger, &queryCount))
 
-	// ---- Start DNS server -----------------------------------------------------
-	server := &dns.Server{
+	// ---- Start DNS servers (UDP + TCP in parallel) ----------------------------
+	// Modern recursive resolvers retry over TCP when a UDP response is truncated
+	// or when they prefer reliability.  Running both transports is required to
+	// catch all successful recursive queries.
+	udpServer := &dns.Server{
 		Addr:    cfg.bind,
 		Net:     "udp",
 		Handler: dns.DefaultServeMux,
 	}
+	tcpServer := &dns.Server{
+		Addr:    cfg.bind,
+		Net:     "tcp",
+		Handler: dns.DefaultServeMux,
+	}
 
-	serverErr := make(chan error, 1)
-	go func() {
+	serverErr := make(chan error, 2)
+
+	startServer := func(srv *dns.Server) {
 		logger.Info("echocatcher starting",
-			"bind", cfg.bind,
+			"bind", srv.Addr,
+			"net", srv.Net,
 			"domain", cfg.domain,
 			"log", cfg.logFile,
 		)
-		if err := server.ListenAndServe(); err != nil {
-			serverErr <- err
+		if err := srv.ListenAndServe(); err != nil {
+			serverErr <- fmt.Errorf("%s: %w", srv.Net, err)
 		}
-	}()
+	}
+
+	go startServer(udpServer)
+	go startServer(tcpServer)
 
 	// ---- Block until signal or server error -----------------------------------
 	sigCh := make(chan os.Signal, 1)
@@ -317,12 +333,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ---- Graceful shutdown ----------------------------------------------------
+	// ---- Graceful shutdown (both transports) ----------------------------------
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
 
-	if err := server.ShutdownContext(shutCtx); err != nil {
-		logger.Error("shutdown error", "err", err)
+	for _, srv := range []*dns.Server{udpServer, tcpServer} {
+		if err := srv.ShutdownContext(shutCtx); err != nil {
+			logger.Error("shutdown error", "net", srv.Net, "err", err)
+		}
 	}
 
 	logger.Info("echocatcher stopped",
