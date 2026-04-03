@@ -86,7 +86,7 @@ There are two distinct phases. The **server** (VPS) is set up once. The **client
 > Run this **on your VPS** as root. This is a one-time setup.
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/alisouran/EchoFlare/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/alisouran/EchoFlare/master/install.sh)
 ```
 
 The installer will walk you through everything interactively. It will:
