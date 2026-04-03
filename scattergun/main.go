@@ -205,6 +205,17 @@ func buildMsg(qname string, qtype uint16, padBytes int) ([]byte, error) {
 		pad.Padding = make([]byte, needed)
 		opt.Option = append(opt.Option, pad)
 		m.Extra = append(m.Extra, opt)
+	} else {
+		// Always include a baseline EDNS0 OPT record even without padding.
+		// Public resolvers (e.g. 8.8.8.8) expect EDNS0 from well-behaved clients;
+		// omitting it can cause resolvers to silently drop or truncate responses.
+		// 1232 bytes is the recommended minimum EDNS0 buffer size (RFC 6891 / DNS
+		// Flag Day 2020) and matches what MasterDnsVPN and modern stub resolvers send.
+		o := new(dns.OPT)
+		o.Hdr.Name = "."
+		o.Hdr.Rrtype = dns.TypeOPT
+		o.SetUDPSize(1232)
+		m.Extra = append(m.Extra, o)
 	}
 
 	return m.Pack()
