@@ -15,6 +15,12 @@
 //	CONFIG=/opt/dns-orchestrator/config.yaml ./orchestrator-bot
 package main
 
+// Injected at build time via -ldflags.
+var (
+	AppVersion = "dev"
+	BuildTime  = "unknown"
+)
+
 import (
 	"bufio"
 	"bytes"
@@ -653,7 +659,10 @@ func main() {
 		scanDomain = "NOT SET — add domain: under scanner: in config.yaml"
 	}
 	adminHelpText := strings.Join([]string{
-		"*🤖 Server Orchestrator Bot — Admin*",
+		"*🤖 EchoFlare Orchestrator*",
+		"🏷 Version: `" + AppVersion + "`",
+		"🕒 Build: `" + BuildTime + "`",
+		"━━━━━━━━━━━━━━━━━━━━━━━━",
 		"",
 		"*Admin Commands:*",
 		"/status — full service states + CPU/RAM",
@@ -1209,7 +1218,7 @@ func main() {
 				{"git fetch", "git -C " + srcDir + " fetch origin"},
 				{"git reset", "git -C " + srcDir + " reset --hard origin/master"},
 				{"go mod tidy", goEnv + "cd " + srcDir + " && go mod tidy"},
-				{"build bot", goEnv + "cd " + srcDir + " && go build -trimpath -ldflags=\"-s -w\" -o /usr/local/bin/orchestrator-bot ./bot/"},
+				{"build bot", goEnv + "cd " + srcDir + " && VERSION=\"rev-$(git rev-parse --short HEAD)\" && BUILD_TIME=\"$(date -u +'%Y-%m-%d %H:%M:%S UTC')\" && go build -trimpath -ldflags=\"-s -w -X 'main.AppVersion=$VERSION' -X 'main.BuildTime=$BUILD_TIME'\" -o /usr/local/bin/orchestrator-bot ./bot/"},
 				{"build echocatcher", goEnv + "cd " + srcDir + " && go build -trimpath -ldflags=\"-s -w\" -o /usr/local/bin/echocatcher ./echocatcher/"},
 			}
 			for _, s := range steps {

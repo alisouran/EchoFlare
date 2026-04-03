@@ -302,7 +302,9 @@ info "Running go mod tidy..."
 go mod tidy
 
 info "Compiling orchestrator-bot..."
-go build -trimpath -ldflags="-s -w" -o "${BOT_BIN}" ./bot/
+VERSION="rev-$(git rev-parse --short HEAD)"
+BUILD_TIME="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+go build -trimpath -ldflags="-s -w -X 'main.AppVersion=${VERSION}' -X 'main.BuildTime=${BUILD_TIME}'" -o "${BOT_BIN}" ./bot/
 
 info "Compiling echocatcher..."
 go build -trimpath -ldflags="-s -w" -o "${CATCHER_BIN}" ./echocatcher/
