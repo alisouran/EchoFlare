@@ -15,12 +15,6 @@
 //	CONFIG=/opt/dns-orchestrator/config.yaml ./orchestrator-bot
 package main
 
-// Injected at build time via -ldflags.
-var (
-	AppVersion = "dev"
-	BuildTime  = "unknown"
-)
-
 import (
 	"bufio"
 	"bytes"
@@ -45,6 +39,12 @@ import (
 
 	tb "gopkg.in/telebot.v3"
 	"gopkg.in/yaml.v3"
+)
+
+// Injected at build time via -ldflags.
+var (
+	AppVersion = "dev"
+	BuildTime  = "unknown"
 )
 
 // ---------------------------------------------------------------------------
