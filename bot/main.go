@@ -608,7 +608,24 @@ func main() {
 	// ---- Help text ------------------------------------------------------------
 	scanDomain := cfg.Scanner.Domain
 	if scanDomain == "" {
-		scanDomain = "scan.yourdomain.com (not set in config)"
+		// Fallback: grep the config file directly in case the YAML key
+		// was written in a format the struct didn't previously capture.
+		if data, err := os.ReadFile(cfgPath); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "domain:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "domain:"))
+					v = strings.Trim(v, `"'`)
+					if v != "" {
+						scanDomain = v
+						break
+					}
+				}
+			}
+		}
+	}
+	if scanDomain == "" {
+		scanDomain = "NOT SET — add domain: under scanner: in config.yaml"
 	}
 	adminHelpText := strings.Join([]string{
 		"*🤖 Server Orchestrator Bot — Admin*",
@@ -1007,8 +1024,8 @@ func main() {
 				{"git fetch", "git -C " + srcDir + " fetch origin"},
 				{"git reset", "git -C " + srcDir + " reset --hard origin/master"},
 				{"go mod tidy", goEnv + "cd " + srcDir + " && go mod tidy"},
-				{"build bot", goEnv + "go build -trimpath -ldflags=\"-s -w\" -o /usr/local/bin/orchestrator-bot " + srcDir + "/bot/"},
-				{"build echocatcher", goEnv + "go build -trimpath -ldflags=\"-s -w\" -o /usr/local/bin/echocatcher " + srcDir + "/echocatcher/"},
+				{"build bot", goEnv + "cd " + srcDir + " && go build -trimpath -ldflags=\"-s -w\" -o /usr/local/bin/orchestrator-bot ./bot/"},
+				{"build echocatcher", goEnv + "cd " + srcDir + " && go build -trimpath -ldflags=\"-s -w\" -o /usr/local/bin/echocatcher ./echocatcher/"},
 			}
 			for _, s := range steps {
 				// Notify before each step so the admin sees live progress.
