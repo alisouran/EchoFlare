@@ -26,7 +26,7 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/hex"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -34,6 +34,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -134,30 +135,35 @@ func qtypeToUint16(qtype string) uint16 {
 // ---------------------------------------------------------------------------
 
 // buildQNAME returns the fully-qualified DNS name to query for a given raw IP
-// string.  The format encodes the target IP as hex and embeds the current Unix
-// timestamp so that latency can be computed on the receiver side.
+// string.  The format encodes the target IP and a Unix timestamp in Base36 so
+// that the resulting labels look like random CDN node identifiers rather than
+// the fixed-length all-hex pattern that DPI systems flag as DNS tunneling.
 //
-//	<hex_ip>.<unix_ts>.<domain>.
-//	e.g.  08080808.1712140000.scan.yourdomain.com.
+//	<base36_ip>.<base36_ts>.<domain>.
+//	e.g.  1d1x2h.lncy2g.scan.yourdomain.com.   (IPv4)
+//	      3x1a2b...x...4c5d.lncy2g.scan.yourdomain.com.  (IPv6, hi "x" lo)
 func buildQNAME(rawIP, domain string) (string, error) {
 	ip := net.ParseIP(strings.TrimSpace(rawIP))
 	if ip == nil {
 		return "", fmt.Errorf("invalid IP address: %q", rawIP)
 	}
 
-	var hexIP string
+	var encodedIP string
 	if v4 := ip.To4(); v4 != nil {
-		// Standard IPv4 → 8 hex characters (e.g. "08080808")
-		hexIP = hex.EncodeToString(v4)
+		// IPv4 → uint32 → base36 (max 7 chars, e.g. "2mowkjv" for 255.255.255.255)
+		ipInt := binary.BigEndian.Uint32(v4)
+		encodedIP = strconv.FormatUint(uint64(ipInt), 36)
 	} else {
-		// Pure IPv6 → 32 hex characters
-		hexIP = hex.EncodeToString(ip.To16())
+		// IPv6 → two uint64 halves in base36, joined by "x" (not a base36 digit)
+		b := ip.To16()
+		hi := binary.BigEndian.Uint64(b[:8])
+		lo := binary.BigEndian.Uint64(b[8:])
+		encodedIP = strconv.FormatUint(hi, 36) + "x" + strconv.FormatUint(lo, 36)
 	}
 
 	ts := time.Now().Unix()
 	// dns.Fqdn appends the trailing dot required by the DNS wire format.
-	// Timestamp encoded as 8-char hex (vs 10-char decimal) to shorten the QNAME label.
-	return dns.Fqdn(fmt.Sprintf("%s.%08x.%s", hexIP, ts, domain)), nil
+	return dns.Fqdn(fmt.Sprintf("%s.%s.%s", encodedIP, strconv.FormatInt(ts, 36), domain)), nil
 }
 
 // ---------------------------------------------------------------------------

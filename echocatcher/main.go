@@ -27,7 +27,7 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -170,16 +170,16 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 				continue
 			}
 
-			hexIP := parts[0]
+			encodedIP := parts[0]
 			tsStr := parts[1]
 
-			// ---- Decode target IP from hex -----------------------------------
-			targetIP := decodeHexIP(hexIP, logger)
+			// ---- Decode target IP from base36 --------------------------------
+			targetIP := decodeBase36IP(encodedIP, logger)
 
 			// ---- Decode timestamp and compute latency ------------------------
 			var latencySec int64
-			// scattergun encodes the timestamp as 8-char hex (e.g. "66079920").
-			ts, err := strconv.ParseInt(tsStr, 16, 64)
+			// scattergun encodes the timestamp in base36 (e.g. "lncy2g").
+			ts, err := strconv.ParseInt(tsStr, 36, 64)
 			if err != nil {
 				logger.Warn("timestamp parse error",
 					"ts_raw", tsStr,
@@ -213,26 +213,34 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 	}
 }
 
-// decodeHexIP converts a hex-encoded IP string back to dotted notation.
+// decodeBase36IP converts a base36-encoded IP string back to dotted/colon notation.
+// IPv4 is a single base36 uint32 label (e.g. "1d1x2h").
+// IPv6 is two base36 uint64 halves joined by "x" (e.g. "3abc...x...4def...").
 // Returns "<decode-error>" on failure and logs a warning.
-func decodeHexIP(hexIP string, logger *slog.Logger) string {
-	rawBytes, err := hex.DecodeString(hexIP)
+func decodeBase36IP(encoded string, logger *slog.Logger) string {
+	if strings.Contains(encoded, "x") {
+		// IPv6 — two base36 uint64 halves separated by "x"
+		halves := strings.SplitN(encoded, "x", 2)
+		hi, err1 := strconv.ParseUint(halves[0], 36, 64)
+		lo, err2 := strconv.ParseUint(halves[1], 36, 64)
+		if err1 != nil || err2 != nil {
+			logger.Warn("base36 ipv6 decode error", "encoded", encoded)
+			return "<decode-error>"
+		}
+		b := make([]byte, 16)
+		binary.BigEndian.PutUint64(b[:8], hi)
+		binary.BigEndian.PutUint64(b[8:], lo)
+		return net.IP(b).String()
+	}
+	// IPv4 — single base36 uint32
+	ipInt, err := strconv.ParseUint(encoded, 36, 32)
 	if err != nil {
-		logger.Warn("hex decode error", "hex", hexIP, "err", err)
+		logger.Warn("base36 ipv4 decode error", "encoded", encoded, "err", err)
 		return "<decode-error>"
 	}
-	switch len(rawBytes) {
-	case 4:
-		return net.IP(rawBytes).String() // IPv4 dotted notation
-	case 16:
-		return net.IP(rawBytes).String() // IPv6 colon notation
-	default:
-		logger.Warn("unexpected decoded length",
-			"hex", hexIP,
-			"len", len(rawBytes),
-		)
-		return "<decode-error>"
-	}
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, uint32(ipInt))
+	return net.IP(b).String()
 }
 
 // dummyA returns a minimal A record pointing to 1.2.3.4 with a 60-second TTL.
