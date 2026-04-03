@@ -65,6 +65,8 @@ type config struct {
 	jitter   time.Duration
 	pad      int    // target wire-size in bytes for EDNS0 padding (0 = disabled)
 	qtype    string // query type: "A", "TXT", or "AAAA"
+	debug    bool   // print a line to stdout for every packet sent
+	canary   string // if set, send one packet directly to this VPS IP and exit
 }
 
 func parseFlags() config {
@@ -76,11 +78,13 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.jitter, "jitter", 150*time.Millisecond, "Max random sleep between retries")
 	flag.IntVar(&cfg.pad, "pad", 0, "Inflate DNS packet to this many bytes using EDNS0 Padding (RFC 7830). 0 = disabled. Use -pad 1000 to simulate VPN tunnel traffic.")
 	flag.StringVar(&cfg.qtype, "qtype", "A", `DNS query type: "A" (default), "TXT", or "AAAA". Combine with -pad for realistic DPI simulation.`)
+	flag.BoolVar(&cfg.debug, "debug", false, "Print a [DEBUG] line to stdout for every packet sent (proof-of-life)")
+	flag.StringVar(&cfg.canary, "canary", "", "VPS IP to send a single test packet to directly (bypasses -list). Prints [CANARY] status and exits.")
 	flag.Parse()
 
 	ok := true
-	if cfg.listFile == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: -list is required")
+	if cfg.listFile == "" && cfg.canary == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: -list is required (or use -canary <vps-ip> for a single test packet)")
 		ok = false
 	}
 	if cfg.domain == "" {
@@ -256,6 +260,7 @@ func worker(
 	jitter time.Duration,
 	qtype uint16,
 	pad int,
+	debug bool,
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
@@ -298,6 +303,9 @@ func worker(
 				log.Printf("DEBUG send error (retry %d/%d) to %s: %v", i+1, retries, rawIP, err)
 			} else {
 				sentCount.Add(1)
+				if debug {
+					fmt.Printf("[DEBUG] Sent to %s: %s (Size: %d bytes)\n", rawIP, qname, len(msgBytes))
+				}
 			}
 
 			// Sleep a random jitter between retries (not after the last one).
@@ -329,6 +337,30 @@ func main() {
 		log.Printf("INFO payload sieve active: targeting %d-byte packets, qtype=%s", cfg.pad, cfg.qtype)
 	}
 
+	// ---- Canary mode: send one packet directly to the VPS and exit -----------
+	// Use -canary <vps-ip> to verify the VPS firewall and EchoCatcher are working
+	// before running a full scan.  EchoCatcher will log target_ip=127.0.0.1 (canary
+	// marker) and forwarder_ip=<your-machine-ip>, confirming the path is open.
+	if cfg.canary != "" {
+		qname, err := buildQNAME("127.0.0.1", cfg.domain)
+		if err != nil {
+			log.Fatalf("[CANARY] Could not build QNAME: %v", err)
+		}
+		msgBytes, err := buildMsg(qname, qtype, cfg.pad)
+		if err != nil {
+			log.Fatalf("[CANARY] Could not pack DNS message: %v", err)
+		}
+		fmt.Printf("[CANARY] Sending test packet to %s:53\n", cfg.canary)
+		fmt.Printf("[CANARY] QNAME: %s\n", qname)
+		fmt.Printf("[CANARY] Packet size: %d bytes\n", len(msgBytes))
+		if err := sendUDP(cfg.canary, msgBytes); err != nil {
+			fmt.Fprintf(os.Stderr, "[CANARY] FAILED to send: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("[CANARY] Packet sent! Watch echocatcher stdout for [INGRESS] and dns_hit with target_ip=127.0.0.1")
+		os.Exit(0)
+	}
+
 	// ---- Open IP list ---------------------------------------------------------
 	f, err := os.Open(cfg.listFile)
 	if err != nil {
@@ -355,7 +387,7 @@ func main() {
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.workers; i++ {
 		wg.Add(1)
-		go worker(ctx, ipChan, cfg.domain, cfg.retries, cfg.jitter, qtype, cfg.pad, &wg)
+		go worker(ctx, ipChan, cfg.domain, cfg.retries, cfg.jitter, qtype, cfg.pad, cfg.debug, &wg)
 	}
 
 	// ---- Progress ticker ------------------------------------------------------

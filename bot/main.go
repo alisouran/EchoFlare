@@ -405,6 +405,24 @@ func countScanHits(path string) int {
 	return count
 }
 
+// countRawPackets counts lines in the echocatcher log that are dns_raw_packet
+// events — packets that arrived on port 53 but didn't match the scan domain.
+// A non-zero count with zero dns_hit entries means traffic is reaching the VPS
+// but the QNAME prefix isn't matching (wrong domain, DPI stripping, etc.).
+func countRawPackets(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if bytes.Contains(line, []byte(`"dns_raw_packet"`)) {
+			count++
+		}
+	}
+	return count
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4 — Scan result helpers
 // ---------------------------------------------------------------------------
@@ -725,13 +743,31 @@ func main() {
 	}
 
 	// buildProgressMsg renders the live scan progress card.
-	buildProgressMsg := func(remaining time.Duration, hits int, domain, status string) string {
+	// rawCount is the number of dns_raw_packet events — any UDP/53 traffic that
+	// reached EchoCatcher but didn't decode as a valid EchoFlare probe.
+	buildProgressMsg := func(remaining time.Duration, hits, rawCount int, domain, status string) string {
 		bar := "━━━━━━━━━━━━━━━━━━━━━━━━"
+		// Compute a smarter status string if the caller passed the default.
+		if status == "" {
+			switch {
+			case hits > 0:
+				status = "Probing stealthily... 🔍"
+			case rawCount > 0:
+				status = "Traffic detected, but no valid EchoFlare probes yet..."
+			default:
+				status = "Probing stealthily... 🔍"
+			}
+		}
+		rawLine := ""
+		if rawCount > 0 {
+			rawLine = fmt.Sprintf("\n📶 Raw UDP/53 Traffic: *%s packets* (port open ✅)", formatInt(rawCount))
+		}
 		return fmt.Sprintf(
-			"📡 *EchoFlare Live Scan*\n%s\n⏳ Remaining Time: `%s`\n🎯 Successful Hits: *%s IPs*\n🔎 Active Domain: `%s`\n%s\nStatus: %s",
+			"📡 *EchoFlare Live Scan* _(Promiscuous Mode)_\n%s\n⏳ Remaining Time: `%s`\n🎯 Successful Hits: *%s IPs*%s\n🔎 Active Domain: `%s`\n%s\nStatus: %s",
 			bar,
 			formatDuration(remaining),
 			formatInt(hits),
+			rawLine,
 			domain,
 			bar,
 			status,
@@ -772,7 +808,7 @@ func main() {
 
 		// Send the initial progress card and keep the message handle for editing.
 		initMsg, initErr := bot.Send(destChat,
-			buildProgressMsg(dur, 0, domain, "Starting services..."),
+			buildProgressMsg(dur, 0, 0, domain, "Starting services..."),
 			tb.ModeMarkdown,
 		)
 		if initErr != nil {
@@ -781,11 +817,14 @@ func main() {
 
 		// editProgress updates the live card; silently ignores Telegram rate-limit
 		// errors (420) — the next tick will retry automatically.
-		editProgress := func(remaining time.Duration, hits int, status string) {
+		// Pass status="" to let buildProgressMsg choose the right text based on counts.
+		editProgress := func(remaining time.Duration, status string) {
 			if initMsg == nil {
 				return
 			}
-			text := buildProgressMsg(remaining, hits, domain, status)
+			hits := countScanHits(logFile)
+			raw := countRawPackets(logFile)
+			text := buildProgressMsg(remaining, hits, raw, domain, status)
 			if _, err := bot.Edit(initMsg, text, tb.ModeMarkdown); err != nil {
 				logger.Debug("scan progress edit error (likely rate-limit)", "err", err)
 			}
@@ -829,7 +868,7 @@ func main() {
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
 
-			editProgress(dur, 0, "Probing stealthily... 🔍")
+			editProgress(dur, "")
 		tickLoop:
 			for {
 				select {
@@ -838,8 +877,7 @@ func main() {
 					if remaining <= 0 {
 						break tickLoop
 					}
-					hits := countScanHits(logFile)
-					editProgress(remaining, hits, "Probing stealthily... 🔍")
+					editProgress(remaining, "")
 					_ = now
 				case <-time.After(time.Until(deadline)):
 					break tickLoop
@@ -847,17 +885,16 @@ func main() {
 			}
 
 			// Step 4: Stop EchoCatcher.
-			editProgress(0, countScanHits(logFile), "Stopping scanner...")
+			editProgress(0, "Stopping scanner...")
 			if err := svcCmd("stop", cfg.Services.Scanner); err != nil {
 				logger.Warn("stop scanner error", "err", err)
 			}
 
-			finalHits := countScanHits(logFile)
-			editProgress(0, finalHits, "Collecting results...")
+			editProgress(0, "Collecting results...")
 
 			// Step 5: Parse results, generate artifacts, deliver files.
 			if _, statErr := os.Stat(logFile); os.IsNotExist(statErr) {
-				editProgress(0, 0, "⚠️ No results file found.")
+				editProgress(0, "⚠️ No results file found.")
 				send("⚠️ Scan log file not found — scan may have produced no results.")
 			} else {
 				hits, parseErr := parseScanHits(logFile)

@@ -119,6 +119,16 @@ func makeHandler(domain string, logger *slog.Logger, queryCount *atomic.Int64) d
 			forwarderIP = forwarderAddr
 		}
 
+		// Emit a human-readable [INGRESS] line for every incoming packet so
+		// it's immediately visible in a live terminal without parsing JSON.
+		// This fires before domain matching, proving packets reach the process.
+		qnames := make([]string, 0, len(r.Question))
+		for _, q := range r.Question {
+			qnames = append(qnames, q.Name)
+		}
+		fmt.Printf("[INGRESS] from %s | %s (%d bytes)\n",
+			forwarderIP, strings.Join(qnames, ", "), payloadBytes)
+
 		// Prepare the reply message.  SetReply copies the question section,
 		// sets QR=1, and defaults RCODE to NOERROR.
 		m := new(dns.Msg)
