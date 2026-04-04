@@ -127,22 +127,22 @@ This makes your VPS the authoritative server for `scan.yourdomain.com`, so all p
 
 #### Step 1 — Download the binary
 
-Go to the [**GitHub Releases page**](https://github.com/alisouran/EchoFlare/releases/latest) and download the archive for your device:
+Download the latest release (v0.0.16) for your device:
 
-| Your Device | File to download |
+| Your Device | Download |
 |---|---|
-| Linux PC / Server (x86-64) | `scattergun-linux-amd64.tar.gz` |
-| Linux (ARM, e.g. Raspberry Pi) | `scattergun-linux-arm64.tar.gz` |
-| macOS (Apple Silicon M1/M2/M3) | `scattergun-darwin-arm64.tar.gz` |
-| macOS (Intel) | `scattergun-darwin-amd64.tar.gz` |
-| Windows PC | `scattergun-windows-amd64.zip` |
-| Android (Termux) | `scattergun-android-arm64.tar.gz` |
+| Linux PC / Server (x86-64) | [EchoFlare-Client-linux-amd64.zip](https://github.com/alisouran/EchoFlare/releases/download/v0.0.16/EchoFlare-Client-linux-amd64.zip) |
+| Linux (ARM64, e.g. Raspberry Pi) | [EchoFlare-Client-linux-arm64.zip](https://github.com/alisouran/EchoFlare/releases/download/v0.0.16/EchoFlare-Client-linux-arm64.zip) |
+| macOS (Apple Silicon M1/M2/M3) | [EchoFlare-Client-darwin-arm64.zip](https://github.com/alisouran/EchoFlare/releases/download/v0.0.16/EchoFlare-Client-darwin-arm64.zip) |
+| macOS (Intel) | [EchoFlare-Client-darwin-amd64.zip](https://github.com/alisouran/EchoFlare/releases/download/v0.0.16/EchoFlare-Client-darwin-amd64.zip) |
+| Windows PC | [EchoFlare-Client-windows-amd64.zip](https://github.com/alisouran/EchoFlare/releases/download/v0.0.16/EchoFlare-Client-windows-amd64.zip) |
+| Android (Termux) | [EchoFlare-Client-termux-arm64.zip](https://github.com/alisouran/EchoFlare/releases/download/v0.0.16/EchoFlare-Client-termux-arm64.zip) |
 
 #### Step 2 — Extract the archive
 
 **Linux / macOS / Android (Termux):**
 ```bash
-tar -xzf scattergun-*.tar.gz
+unzip EchoFlare-Client-*.zip
 chmod +x scattergun
 ```
 
@@ -223,38 +223,35 @@ Wait for the timer to complete (5 minutes in this example). The bot will automat
 - Stop EchoCatcher
 - Parse and sort all hits by latency
 - Send `working_resolvers.json` (every raw hit)
-- Send `masterdnsvpn_resolvers.toml` (top 50 fastest resolvers, ready to paste)
+- Send `top100_resolvers.txt` (top 100 fastest resolver IPs, one per line)
 - Restart your VPN
 
 ```
 Bot: 📎 working_resolvers.json  ← all resolver hits with latency data
-Bot: 📎 masterdnsvpn_resolvers.toml  ← top 50 for MasterDnsVPN
-Bot: ✨ Scan Complete! 1,247 clean resolver IPs found. Top 50 exported.
+Bot: 📎 top100_resolvers.txt    ← top 100 IPs, one per line
+Bot: ✨ Scan Complete! 1,247 clean resolver IPs found. Top 100 exported.
 Bot: ✅ VPN restarted. Scan lifecycle complete.
 ```
 
-### Phase 4 — MasterDnsVPN Auto-Integration
+### Phase 4 — Results
 
-The bot does the heavy lifting for you. After every scan it:
+After every scan the bot:
 
 1. Parses all `dns_hit` records from the NDJSON log
 2. Sorts them by `latency_sec` (lowest first)
-3. Takes the top 50 and generates a ready-to-paste TOML config
+3. Takes the top 100 and writes `top100_resolvers.txt` — a plain list of IPs, one per line
 
-**Example `masterdnsvpn_resolvers.toml` output:**
+**Example `top100_resolvers.txt` output:**
 
-```toml
-[Resolvers]
-List = [
-    "udp://8.8.8.8:53",
-    "udp://1.1.1.1:53",
-    "udp://[2001:db8::1]:53",
-]
+```
+8.8.8.8
+1.1.1.1
+9.9.9.9
+208.67.222.222
+2001:db8::1
 ```
 
-IPv6 addresses are automatically enclosed in brackets (`[...]`) so MasterDnsVPN's TOML parser never crashes. Just copy the file into your MasterDnsVPN config directory and restart the service.
-
-The raw `working_resolvers.json` is always sent first. If it is too large for Telegram's upload limit, the bot logs a warning and still sends the TOML — you never lose your config.
+The raw `working_resolvers.json` is always sent first. If it is too large for Telegram's upload limit, the bot logs a warning and still sends the TXT file — you never lose your results.
 
 ---
 
@@ -266,7 +263,7 @@ The Orchestrator Bot is your remote control. It handles the Port 53 hand-off aut
 
 | Command | What it does |
 |---|---|
-| `/scan <duration>` | Full scan lifecycle: stop VPN → start EchoCatcher → wait → send results → restart VPN. Shows a **live progress card** that updates every 5 seconds with remaining time, hit count, and active domain — edited in-place so the chat stays clean. Delivers **two files** when done: `working_resolvers.json` and `masterdnsvpn_resolvers.toml` (top 50 by latency). Example: `/scan 5m` |
+| `/scan <duration>` | Full scan lifecycle: stop VPN → start EchoCatcher → wait → send results → restart VPN. Shows a **live progress card** that updates every 5 seconds with remaining time, hit count, and active domain — edited in-place so the chat stays clean. Delivers **two files** when done: `working_resolvers.json` and `top100_resolvers.txt` (top 100 by latency, one IP per line). Example: `/scan 5m` |
 | `/help` | For the **Admin**: shows all commands plus a **📡 Scan Configuration** section with the active scan domain and a ready-to-copy `scattergun` command template. For public users: shows a generic welcome message. |
 | `/status` | Live service states + server CPU% and RAM, plus registered user count |
 | `/toggle_vpn` | Start the VPN if stopped; stop it if running |
@@ -382,7 +379,12 @@ EchoFlare/
 ├── echocatcher/
 │   └── main.go              ← authoritative DNS receiver + NDJSON logger
 ├── bot/
-│   └── main.go              ← Telegram orchestrator bot
+│   ├── main.go              ← Telegram bot, command handlers
+│   ├── scan.go              ← scan lifecycle, result parsing, file generation
+│   └── service.go           ← systemd service management, health monitoring
+├── internal/
+│   └── payload/
+│       └── payload.go       ← Base32 IP+timestamp encoding/decoding
 ├── config.yaml              ← sample configuration (do not commit with real tokens)
 ├── orchestrator.service     ← systemd unit file template
 ├── install.sh               ← automated one-command VPS installer

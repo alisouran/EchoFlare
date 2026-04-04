@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -100,32 +99,17 @@ func parseScanHits(path string) ([]Hit, error) {
 	return hits, nil
 }
 
-// generateMasterDNSVPNTOML takes the top 50 lowest-latency hits and builds a
-// ready-to-paste TOML snippet for MasterDnsVPN.
-//
-// IPv6 addresses are enclosed in brackets to prevent MasterDnsVPN's TOML
-// parser from crashing:
-//
-//	IPv4: "udp://8.8.8.8:53"
-//	IPv6: "udp://[2001:db8::1]:53"
-func generateMasterDNSVPNTOML(hits []Hit) string {
+// generateResolversTxt takes the top 100 lowest-latency hits and returns a
+// plain-text list of IPs, one per line.
+func generateResolversTxt(hits []Hit) string {
 	top := hits
-	if len(top) > 50 {
-		top = top[:50]
+	if len(top) > 100 {
+		top = top[:100]
 	}
 	var sb strings.Builder
-	sb.WriteString("[Resolvers]\nList = [\n")
 	for _, h := range top {
-		ip := net.ParseIP(h.TargetIP)
-		var entry string
-		if ip != nil && ip.To4() == nil {
-			entry = fmt.Sprintf(`    "udp://[%s]:53"`, h.TargetIP)
-		} else {
-			entry = fmt.Sprintf(`    "udp://%s:53"`, h.TargetIP)
-		}
-		sb.WriteString(entry + ",\n")
+		sb.WriteString(h.TargetIP + "\n")
 	}
-	sb.WriteString("]\n")
 	return sb.String()
 }
 
@@ -337,32 +321,32 @@ tickLoop:
 			send(fmt.Sprintf("⚠️ Could not send raw JSON (file may be too large): %v", err))
 		}
 
-		// Always attempt the TOML even if JSON delivery failed.
+		// Always attempt the TXT even if JSON delivery failed.
 		if parseErr == nil && len(hits) > 0 {
-			tomlContent := generateMasterDNSVPNTOML(hits)
-			tomlPath := filepath.Join(filepath.Dir(logFile), "masterdnsvpn_resolvers.toml")
-			if writeErr := os.WriteFile(tomlPath, []byte(tomlContent), 0o644); writeErr != nil {
-				logger.Error("write toml file error", "err", writeErr)
-				send(fmt.Sprintf("⚠️ Could not write TOML file: %v", writeErr))
+			txtContent := generateResolversTxt(hits)
+			txtPath := filepath.Join(filepath.Dir(logFile), "top100_resolvers.txt")
+			if writeErr := os.WriteFile(txtPath, []byte(txtContent), 0o644); writeErr != nil {
+				logger.Error("write resolvers txt error", "err", writeErr)
+				send(fmt.Sprintf("⚠️ Could not write resolvers file: %v", writeErr))
 			} else {
 				top := hitCount
-				if top > 50 {
-					top = 50
+				if top > 100 {
+					top = 100
 				}
-				tomlDoc := &tb.Document{
-					File:     tb.FromDisk(tomlPath),
-					FileName: "masterdnsvpn_resolvers.toml",
-					Caption:  fmt.Sprintf("Top %d resolvers for MasterDnsVPN (sorted by latency)", top),
+				txtDoc := &tb.Document{
+					File:     tb.FromDisk(txtPath),
+					FileName: "top100_resolvers.txt",
+					Caption:  fmt.Sprintf("Top %d resolvers (sorted by latency)", top),
 				}
-				if _, err := bot.Send(destChat, tomlDoc); err != nil {
-					logger.Error("send toml doc error", "err", err)
-					send(fmt.Sprintf("⚠️ Could not send TOML config: %v", err))
+				if _, err := bot.Send(destChat, txtDoc); err != nil {
+					logger.Error("send resolvers txt error", "err", err)
+					send(fmt.Sprintf("⚠️ Could not send resolvers file: %v", err))
 				}
 			}
 		}
 
 		safeSend(adminChat,
-			fmt.Sprintf("✨ *Scan Complete!*\n%s clean resolver IPs found.\nTop 50 exported to `masterdnsvpn_resolvers.toml`.\n\nBoth files sent above.", formatInt(hitCount)),
+			fmt.Sprintf("✨ *Scan Complete!*\n%s clean resolver IPs found.\nTop 100 exported to `top100_resolvers.txt`.\n\nBoth files sent above.", formatInt(hitCount)),
 			tb.ModeMarkdown,
 		)
 
