@@ -27,6 +27,29 @@ import (
 // confounds DPI signatures that flag short high-entropy labels as tunneling.
 var Codec = base32.StdEncoding.WithPadding(base32.NoPadding)
 
+// payloadBase32Len is the exact Base32-encoded length of the 32-byte probe
+// payload (ceil(32*8/5) = 52 chars, NoPadding). Characters beyond this
+// position are DKIM camouflage padding and must be stripped before decoding.
+const payloadBase32Len = 52
+
+// base32Alphabet is the RFC 4648 Base32 character set used to generate
+// random DKIM-style camouflage suffixes.
+const base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+// randBase32Suffix returns n cryptographically random characters from the
+// Base32 alphabet, appended to probe labels to mimic DKIM selector queries.
+func randBase32Suffix(n int) string {
+	b := make([]byte, n)
+	if _, err := crand.Read(b); err != nil {
+		return strings.Repeat("A", n) // safe fallback; crypto/rand never fails in practice
+	}
+	out := make([]byte, n)
+	for i, v := range b {
+		out[i] = base32Alphabet[int(v)%32]
+	}
+	return string(out)
+}
+
 // BuildQNAME returns the fully-qualified DNS name to query for a given raw IP
 // string.  The payload is packed into a fixed 32-byte binary blob and encoded
 // as a single Base32 label (52 uppercase chars), mimicking a DKIM/SPF selector
@@ -62,9 +85,10 @@ func BuildQNAME(rawIP, domain string) (string, error) {
 		}
 	}
 
-	label := Codec.EncodeToString(payload) // always 52 chars, uppercase, no "="
+	label := Codec.EncodeToString(payload)      // always 52 chars, uppercase, no "="
+	dkim := randBase32Suffix(8)                 // 8-char DKIM camouflage suffix
 	// dns.Fqdn appends the trailing dot required by the DNS wire format.
-	return dns.Fqdn(fmt.Sprintf("%s.%s", label, domain)), nil
+	return dns.Fqdn(fmt.Sprintf("%s%s.%s", label, dkim, domain)), nil
 }
 
 // DecodeBase32Payload decodes a 52-char Base32 label produced by BuildQNAME
@@ -75,7 +99,12 @@ func BuildQNAME(rawIP, domain string) (string, error) {
 //	IPv4: [0x04][4-byte IP][8-byte TS big-endian][19 random filler]
 //	IPv6: [0x06][16-byte IP][8-byte TS big-endian][7 random filler]
 func DecodeBase32Payload(label string) (targetIP string, ts int64, err error) {
-	payload, err := Codec.DecodeString(strings.ToUpper(label))
+	upper := strings.ToUpper(label) // Fix #1: handle DNS 0x20 case randomization
+	if len(upper) < payloadBase32Len {
+		return "", 0, fmt.Errorf("label too short: got %d chars, need %d", len(upper), payloadBase32Len)
+	}
+	upper = upper[:payloadBase32Len] // Fix #2: strip DKIM camouflage suffix
+	payload, err := Codec.DecodeString(upper)
 	if err != nil {
 		return "", 0, fmt.Errorf("base32 decode: %w", err)
 	}
