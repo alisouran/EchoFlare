@@ -148,3 +148,35 @@ func svcStatusEmoji(state string) string {
 		return "⚠️ " + state
 	}
 }
+
+// rewriteEchocatcherService overwrites /etc/systemd/system/echocatcher.service
+// with the current domain and log-file path from config, then runs daemon-reload.
+// This fixes stale -domain/-log flags baked in by install.sh at install time.
+func rewriteEchocatcherService(domain, logFile string) error {
+	const unit = "/etc/systemd/system/echocatcher.service"
+	content := fmt.Sprintf(`[Unit]
+Description=EchoCatcher DNS Receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/echocatcher -domain %s -log %s -bind 0.0.0.0:53
+Restart=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=echocatcher
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+`, domain, logFile)
+
+	if err := os.WriteFile(unit, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("write echocatcher.service: %w", err)
+	}
+	if out, err := exec.Command("sudo", "systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("daemon-reload: %w — %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

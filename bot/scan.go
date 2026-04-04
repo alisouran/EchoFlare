@@ -257,7 +257,12 @@ func runScan(
 		f.Close()
 	}
 
-	// ── Step 1: Start EchoCatcher ──────────────────────────────────────
+	// ── Step 1: Refresh echocatcher.service, then start ───────────────
+	// Rewrite the unit file so -domain/-log always reflect the live config,
+	// not whatever install.sh baked in at install time.
+	if err := rewriteEchocatcherService(domain, logFile); err != nil {
+		logger.Warn("scan: could not rewrite echocatcher.service (using existing unit)", "err", err)
+	}
 	if err := svcCmd("start", scannerService); err != nil {
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "Unit") {
